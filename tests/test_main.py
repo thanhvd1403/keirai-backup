@@ -1354,6 +1354,66 @@ class TestToolLoop(unittest.TestCase):
             self.assertNotIn("<function", t)
 
     @mock.patch.object(providers, "chat")
+    def test_round_reasoning_rides_in_context(self, chat_mock):
+        """A round's reasoning is stored on its assistant message, so the
+        NEXT round re-reads the model's own analysis instead of starting
+        cold. Provider accepts reasoning_content next to tool_calls
+        (verified live against go/deepseek-v4.1-flash)."""
+        tc = [{"id": "c1", "name": "read_file", "arguments": {"path": "no.txt"}}]
+        chat_mock.side_effect = [("", "I should read that file.", tc),
+                                 ("final", "It was missing.", None)]
+        main.handle_message(self.cfg, self.tg, msg(text="go"), self.state)
+        # round 2's request carries round 1's reasoning on the assistant msg
+        r2 = [m for m in chat_mock.call_args_list[1][0][3]
+              if m.get("role") == "assistant" and m.get("tool_calls")]
+        self.assertEqual(len(r2), 1)
+        self.assertEqual(r2[0]["reasoning_content"], "I should read that file.")
+        # the final answer's own reasoning is stored too
+        hist = self.state.get_history(100, None)
+        self.assertEqual(hist[1]["reasoning_content"], "I should read that file.")
+        self.assertEqual(hist[3]["reasoning_content"], "It was missing.")
+        # ...and it is COUNTED, or auto-compact fires late
+        self.assertGreater(main._history_tokens(hist),
+                           main._est_tokens("I should read that file."))
+
+    @mock.patch.object(providers, "chat")
+    def test_no_reasoning_key_when_model_thinks_not(self, chat_mock):
+        """Provider without reasoning support: no empty key is invented."""
+        chat_mock.side_effect = [("", "", [{"id": "c1", "name": "read_file",
+                                            "arguments": {"path": "no.txt"}}]),
+                                 ("done", "", None)]
+        main.handle_message(self.cfg, self.tg, msg(text="go"), self.state)
+        hist = self.state.get_history(100, None)
+        for m in hist:
+            self.assertNotIn("reasoning_content", m)
+
+    @mock.patch.object(providers, "chat")
+    def test_long_reasoning_is_tail_capped(self, chat_mock):
+        """Display-length reasoning must not be re-billed in full on every
+        call: only the last REASONING_KEEP_CHARS go into context."""
+        long_thought = ("x" * (main.REASONING_KEEP_CHARS + 5000)) + "CONCLUSION"
+        tc = [{"id": "c1", "name": "read_file", "arguments": {"path": "no.txt"}}]
+        chat_mock.side_effect = [("", long_thought, tc),
+                                 ("final", "", None)]
+        main.handle_message(self.cfg, self.tg, msg(text="go"), self.state)
+        hist = self.state.get_history(100, None)
+        stored = hist[1]["reasoning_content"]
+        self.assertEqual(len(stored), main.REASONING_KEEP_CHARS)
+        self.assertTrue(stored.endswith("CONCLUSION"))  # the tail survives
+
+    @mock.patch.object(providers, "chat")
+    def test_interrupted_turn_keeps_reasoning(self, chat_mock):
+        """/stop mid-turn still records what the model was thinking."""
+        def side_effect(*a, **k):
+            self.state.request_interrupt((100, None))
+            return ("partial", "thinking about it", None)
+        chat_mock.side_effect = side_effect
+        main.handle_message(self.cfg, self.tg, msg(text="go"), self.state)
+        hist = self.state.get_history(100, None)
+        self.assertIn(main.INTERRUPT_NOTE, hist[-1]["content"])
+        self.assertEqual(hist[-1]["reasoning_content"], "thinking about it")
+
+    @mock.patch.object(providers, "chat")
     def test_tool_round_remembered_next_turn(self, chat_mock):
         """The core fix: round N's input+output stay in history, so turn 2's
         request already carries them - no re-reading the same file."""

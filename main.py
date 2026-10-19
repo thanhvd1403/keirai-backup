@@ -30,6 +30,8 @@ log = logging.getLogger("keirai")
 CHARS_PER_TOKEN = 4  # ordinary ASCII text: this many chars per token
 IMAGE_KEEP = 4  # newest image-bearing messages whose pictures are re-sent
 COMPACT_FALLBACK_KEEP = 6  # floor of the last-resort trim (see chat_with_history)
+REASONING_KEEP_CHARS = 4000  # reasoning kept per assistant message in context
+                             # (tail only - conclusions live at the end)
 SESSION_ID = "keirai"  # anonymized x-opencode-session for the whole app (no chat ids)
 TITLE_WAIT = 10  # seconds the rename may take before the reply starts (derived
                  # title past that - the rename itself always happens first)
@@ -1358,6 +1360,11 @@ def _msg_tokens(m):
         f = call.get("function") or {}
         n += _est_tokens(str(f.get("name") or ""))
         n += _est_tokens(str(f.get("arguments") or ""))
+    # reasoning rides in context too (assistant messages): count it, or
+    # auto-compact fires late and the request overruns the real window
+    r = m.get("reasoning_content")
+    if isinstance(r, str):
+        n += _est_tokens(r)
     return n
 
 
@@ -1367,7 +1374,8 @@ def _history_tokens(history, cfg=None):
     Tool use is context too and used to be invisible: a call's name + JSON
     arguments ride on the assistant message (never in `content`) and the
     result is its own role:"tool" message - both are sent to the model, so
-    both are counted here. With cfg, the system prompt is counted as well:
+    both are counted here, as is `reasoning_content` when a round's reasoning
+    is kept in context. With cfg, the system prompt is counted as well:
     it rides on every call."""
     n = sum(_msg_tokens(m) for m in history)
     if cfg is not None and cfg.system_prompt:
@@ -1478,6 +1486,18 @@ def _prompt(history):
         msg["content"] = fresh
         out[i] = msg
     return history if out is None else out
+
+
+def _store_reasoning(msg, reasoning):
+    """Attach a round's reasoning to an assistant message that goes into
+    context. Only the TAIL is kept: reasoning is display-length (thousands
+    of characters) and every stored message is re-sent on every call, so an
+    unbounded copy would re-bill the same tokens on each request forever.
+    The tail is where the conclusions are. No-op when there is none."""
+    r = (reasoning or "").strip()
+    if r:
+        msg["reasoning_content"] = r[-REASONING_KEEP_CHARS:]
+    return msg
 
 
 def _thinking_html(text):
@@ -1895,6 +1915,11 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
                        "function": {"name": t["name"],
                                     "arguments": json.dumps(t["arguments"])}}
                       for t in tcs]}
+        # the round's reasoning rides in context too: on the next round the
+        # model re-reads its own analysis instead of starting cold (the
+        # provider accepts reasoning_content on an assistant message that
+        # also carries tool_calls - verified against go/deepseek-v4.1-flash)
+        _store_reasoning(tc_msg, reasoning)
         messages.append(tc_msg)
         history.append(tc_msg)
         for t in tcs:
@@ -1931,7 +1956,7 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
         answer = None  # next round must produce the final text
 
     if interrupted or stop():
-        _deliver_interrupted(tg, state, msg, thread_id, answer, live)
+        _deliver_interrupted(tg, state, msg, thread_id, answer, live, reasoning)
         return
 
     if not (answer or "").strip():
@@ -1952,7 +1977,9 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
     log.info("turn done: chat=%s thread=%s tool_rounds=%d answer=%d chars",
              chat_id, thread_id, rounds, len(answer or ""))
 
-    history.append({"role": "assistant", "content": answer})
+    hist_msg = {"role": "assistant", "content": answer}
+    _store_reasoning(hist_msg, reasoning)  # last round's reasoning stays in context
+    history.append(hist_msg)
     _strip_orphan_tools(history)
     state.persist(chat_id, thread_id)
 
@@ -1970,13 +1997,15 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
             tg.send(chat_id, part, thread_id)
 
 
-def _deliver_interrupted(tg, state, msg, thread_id, partial, live):
+def _deliver_interrupted(tg, state, msg, thread_id, partial, live, reasoning=None):
     """Record the /stop interruption in context and tell the user."""
     chat_id = msg["chat"]["id"]
     history = state.get_history(chat_id, thread_id)
     _close_tool_rounds(history)  # keep the partial round; close its calls
     body = (((partial or "").strip() + "\n\n") if (partial or "").strip() else "")
-    history.append({"role": "assistant", "content": body + INTERRUPT_NOTE})
+    hist_msg = {"role": "assistant", "content": body + INTERRUPT_NOTE}
+    _store_reasoning(hist_msg, reasoning)  # what it was thinking when stopped
+    history.append(hist_msg)
     _strip_orphan_tools(history)
     state.persist(chat_id, thread_id)
     _drop_live(tg, live, chat_id)  # drop the half-finished live message(s)
