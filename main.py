@@ -1493,11 +1493,42 @@ def _store_reasoning(msg, reasoning):
     context. Only the TAIL is kept: reasoning is display-length (thousands
     of characters) and every stored message is re-sent on every call, so an
     unbounded copy would re-bill the same tokens on each request forever.
-    The tail is where the conclusions are. No-op when there is none."""
+    The tail is where the conclusions are.
+
+    The key is ALWAYS written - as "" when there is no reasoning - because
+    the DeepSeek provider rejects a history where the key is present on some
+    assistant messages and absent on others (see _ensure_reasoning)."""
     r = (reasoning or "").strip()
-    if r:
-        msg["reasoning_content"] = r[-REASONING_KEEP_CHARS:]
+    msg["reasoning_content"] = r[-REASONING_KEEP_CHARS:] if r else ""
     return msg
+
+
+def _unavailable(name, declared):
+    """What the model is told when it calls a tool this request never
+    offered - a hallucinated name, one turned off in config, or markup it
+    merely QUOTED while describing a format. Answering rather than silently
+    skipping keeps the round valid (one tool result per call, or the API
+    rejects the history) and lets the model correct itself."""
+    if declared:
+        return ("[tool unavailable: %s - this session offers only: %s]"
+                % (name, ", ".join(sorted(declared))))
+    return ("[tool unavailable: %s - no tools are enabled in this session]"
+            % name)
+
+
+def _ensure_reasoning(messages):
+    """Every assistant message must CARRY a `reasoning_content` key for the
+    DeepSeek provider (opencode-go), or the request is refused:
+    "The `reasoning_content` in the thinking mode must be passed back to the
+    API." - it rejects a history where some assistant messages have the key
+    and others do not. An empty string satisfies it, so a message that never
+    thought carries "" (measured on go/deepseek-v4.1-flash; mimo-v2.6-flash
+    accepts both shapes). Mutates in place - called on the outgoing list,
+    which shares dicts with stored history, so a session written before this
+    rule is repaired on its next request rather than rewritten."""
+    for m in messages:
+        if m.get("role") == "assistant":
+            m.setdefault("reasoning_content", "")
 
 
 def _thinking_html(text):
@@ -1820,6 +1851,10 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
     messages = ([{"role": "system", "content": cfg.system_prompt}]
                 if cfg.system_prompt else []) + _prompt(history)
     tool_specs = tools_mod.available_specs(cfg)
+    # the tool names THIS request offers - the guard for calls parsed out of
+    # text, which cannot distinguish a real call from markup the model merely
+    # quoted while describing a format
+    declared = {s.get("function", {}).get("name") for s in (tool_specs or [])}
     # session_id stays the anonymized app-wide constant (provider header);
     # spill_session is this session's own id -> spill files land in
     # sessions/<session-id>/tool_output/
@@ -1855,6 +1890,7 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
         if stop():
             interrupted = True
             break
+        _ensure_reasoning(messages)  # DeepSeek refuses a history missing the key
         tcs, got = None, False
         if live:
             susage = {}
@@ -1888,6 +1924,14 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
             # never reach the chat
             tcs, answer = textcalls.recover(answer)
             if not tcs:
+                if textcalls.has_markup(answer):
+                    # MARKUP, but nothing parseable. Deliberately NOT a retry
+                    # and NOT a guess at the damage: the answer goes out as
+                    # plain text so an unseen dialect stays VISIBLE and can
+                    # be supported later (user directive), with the log
+                    # flagging that markup was seen.
+                    log.warning("unparsable tool-call markup - delivered as "
+                                "text: chat=%s thread=%s", chat_id, thread_id)
                 break  # the model produced its final text
             log.warning("recovered text-form tool call(s) - model bypassed "
                         "the tools API: chat=%s thread=%s", chat_id, thread_id)
@@ -1926,6 +1970,18 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
             if stop():
                 interrupted = True
                 break
+            if t["name"] not in declared:
+                # a tool this request never offered. Answer it rather than
+                # skipping it: the API requires one result per call, and the
+                # model gets to correct itself instead of stalling.
+                result = _unavailable(t["name"], declared)
+                log.warning("tool call for unavailable tool: %s (chat=%s "
+                            "thread=%s)", t["name"], chat_id, thread_id)
+                messages.append({"role": "tool", "tool_call_id": t["id"],
+                                 "content": result})
+                history.append({"role": "tool", "tool_call_id": t["id"],
+                                "content": result})
+                continue
             try:
                 tg.send(chat_id, "\U0001f527 <code>%s</code> %s"
                         % (_esc(t["name"]),
@@ -1970,13 +2026,17 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
             _err(tg, msg, thread_id, "%s error: %s" % (provider_name, e))
             return
 
-    if "<function=" in (answer or "") or "<function:" in (answer or ""):
+    if textcalls.looks_like(answer):
         log.warning("answer contains text-form tool calls (model bypassed the "
                     "tools API) - delivering as text: chat=%s thread=%s",
                     chat_id, thread_id)
     log.info("turn done: chat=%s thread=%s tool_rounds=%d answer=%d chars",
              chat_id, thread_id, rounds, len(answer or ""))
 
+    # a leak that never became a call must not be persisted: the model copies
+    # its own degraded output forward, so one broken reply poisons every turn
+    # after it. Sanitizing here also fixes what chat is about to show.
+    answer = textcalls.sanitize(answer)
     hist_msg = {"role": "assistant", "content": answer}
     _store_reasoning(hist_msg, reasoning)  # last round's reasoning stays in context
     history.append(hist_msg)
@@ -2002,6 +2062,7 @@ def _deliver_interrupted(tg, state, msg, thread_id, partial, live, reasoning=Non
     chat_id = msg["chat"]["id"]
     history = state.get_history(chat_id, thread_id)
     _close_tool_rounds(history)  # keep the partial round; close its calls
+    partial = textcalls.sanitize(partial or "")  # never persist a leak
     body = (((partial or "").strip() + "\n\n") if (partial or "").strip() else "")
     hist_msg = {"role": "assistant", "content": body + INTERRUPT_NOTE}
     _store_reasoning(hist_msg, reasoning)  # what it was thinking when stopped

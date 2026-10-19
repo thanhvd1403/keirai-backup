@@ -1354,6 +1354,171 @@ class TestToolLoop(unittest.TestCase):
             self.assertNotIn("<function", t)
 
     @mock.patch.object(providers, "chat")
+    def test_assistant_reasoning_key_always_present(self, chat_mock):
+        """go/deepseek-v4.1-flash refuses a history where SOME assistant
+        messages carry reasoning_content and others do not: "The
+        reasoning_content in the thinking mode must be passed back to the
+        API." Every assistant message in the outgoing payload must have the
+        key - an empty string is accepted."""
+        tc = [{"id": "c1", "name": "read_file", "arguments": {"path": "no.txt"}}]
+        chat_mock.side_effect = [("", "", tc),   # round 1: thinking produced
+                                 ("final answer", "", None)]
+        main.handle_message(self.cfg, self.tg, msg(text="go"), self.state)
+        self.assertGreaterEqual(chat_mock.call_count, 2)
+        for call in chat_mock.call_args_list:
+            for m in call[0][3]:
+                if m.get("role") == "assistant":
+                    self.assertIn("reasoning_content", m)
+                    self.assertIsInstance(m["reasoning_content"], str)
+
+    @mock.patch.object(providers, "chat")
+    def test_legacy_history_still_sends(self, chat_mock):
+        """A session stored before this rule keeps working: the outgoing
+        payload gains reasoning_content: "" rather than 400ing."""
+        hist = self.state.get_history(100, None)
+        hist.append({"role": "assistant", "content": "old answer"})  # no key
+        chat_mock.return_value = ("new answer", "", None)
+        main.handle_message(self.cfg, self.tg, msg(text="hi"), self.state)
+        assistants = [m for m in chat_mock.call_args[0][3]
+                      if m.get("role") == "assistant"]
+        self.assertTrue(assistants)
+        for m in assistants:
+            self.assertEqual(m["reasoning_content"], "")
+
+    @mock.patch.object(providers, "chat")
+    def test_assistant_reasoning_key_always_present(self, chat_mock):
+        """go/deepseek-v4.1-flash refuses a history where SOME assistant
+        messages carry reasoning_content and others do not: "The
+        reasoning_content in the thinking mode must be passed back to the
+        API." Every assistant message in the outgoing payload must have the
+        key - an empty string is accepted."""
+        tc = [{"id": "c1", "name": "read_file", "arguments": {"path": "no.txt"}}]
+        chat_mock.side_effect = [("", "", tc),   # round 1: nothing thought
+                                 ("final answer", "", None)]
+        main.handle_message(self.cfg, self.tg, msg(text="go"), self.state)
+        self.assertGreaterEqual(chat_mock.call_count, 2)
+        for call in chat_mock.call_args_list:
+            for m in call[0][3]:
+                if m.get("role") == "assistant":
+                    self.assertIn("reasoning_content", m)
+                    self.assertIsInstance(m["reasoning_content"], str)
+
+    @mock.patch.object(providers, "chat")
+    def test_legacy_history_still_sends(self, chat_mock):
+        """A session stored before this rule keeps working: the outgoing
+        payload gains reasoning_content: "" rather than 400ing."""
+        hist = self.state.get_history(100, None)
+        hist.append({"role": "assistant", "content": "old answer"})  # no key
+        chat_mock.return_value = ("new answer", "", None)
+        main.handle_message(self.cfg, self.tg, msg(text="hi"), self.state)
+        assistants = [m for m in chat_mock.call_args[0][3]
+                      if m.get("role") == "assistant"]
+        self.assertTrue(assistants)
+        for m in assistants:
+            self.assertEqual(m["reasoning_content"], "")
+
+    @mock.patch.object(providers, "chat")
+    def test_unparsable_markup_is_delivered_not_retried(self, chat_mock):
+        """A reply leaking markup no grammar can parse is NOT re-asked and
+        NOT guessed at: it is delivered as plain text and logged, so an
+        unseen dialect stays visible in chat and can be supported later
+        (user directive)."""
+        # an invoke with no closing tag - no grammar matches it, and it is
+        # not DSML, so sanitize() leaves it alone on purpose
+        broken = ("<function_calls><antml:invoke name=\"read_file\">"
+                  "<antml:parameter name=\"path\">SECRET-MARKUP")
+        chat_mock.return_value = (broken, "", None)
+        main.handle_message(self.cfg, self.tg, msg(text="read it"), self.state)
+        # exactly one request - no retry, no correction
+        self.assertEqual(chat_mock.call_count, 1)
+        # no tool ran, so no tool round in the session
+        self.assertEqual([m["role"] for m in self.state.get_history(100, None)],
+                         ["user", "assistant"])
+        # the reply reached chat in full: an UNSEEN dialect stays visible
+        self.assertIn("SECRET-MARKUP", self.tg.rich[-1][1]["markdown"])
+
+    @mock.patch.object(providers, "chat")
+    def test_unparsable_leak_never_reaches_history(self, chat_mock):
+        """A reply that leaks markup and is never parsed must not be stored:
+        the model copies its own degraded output forward, so one leak poisons
+        every later turn."""
+        damaged = ("here: <｜DSML｜ invoke name=\"bash\">"
+                   "<｜DSML｜ parameter name=\"command\" string=\"true\">pwd")
+        chat_mock.return_value = (damaged, "", None)
+        main.handle_message(self.cfg, self.tg, msg(text="go"), self.state)
+        for m in self.state.get_history(100, None):
+            if m.get("role") == "assistant":
+                self.assertNotIn("DSML", m["content"])
+        self.assertNotIn("DSML", self.tg.rich[-1][1]["markdown"])
+
+    @mock.patch.object(providers, "chat")
+    def test_unavailable_tool_is_answered_not_executed(self, chat_mock):
+        """A call for a tool this request never offered - a hallucinated
+        name, one turned off in config, or markup merely QUOTED while
+        describing a format - is answered with "tool unavailable" rather
+        than skipped: the round stays valid, the model gets to correct
+        itself, and nothing runs."""
+        quoted = ("<｜DSML｜ invoke name=\"rm\">"
+                  "<｜DSML｜ parameter name=\"path\" string=\"true\">/etc"
+                  "</｜DSML｜ parameter></｜DSML｜ invoke>")
+        chat_mock.side_effect = [("here is the format: " + quoted, "", None),
+                                 ("ok, plain answer", "", None)]
+        main.handle_message(self.cfg, self.tg, msg(text="explain dsml"),
+                            self.state)
+        self.assertEqual(chat_mock.call_count, 2)
+        # the round WAS answered - one tool result, naming the offered set
+        results = [m for m in chat_mock.call_args_list[1][0][3]
+                   if m.get("role") == "tool"]
+        self.assertEqual(len(results), 1)
+        self.assertIn("tool unavailable: rm", results[0]["content"])
+        self.assertIn("read_file", results[0]["content"])
+        # nothing executed, so no 🔧 line was shown for it
+        self.assertFalse(any("rm" in t for _c, t, _th in self.tg.sent))
+        # session stays valid: no dangling tool_calls left in history
+        hist = self.state.get_history(100, None)
+        self.assertEqual([m["role"] for m in hist],
+                         ["user", "assistant", "tool", "assistant"])
+        self.assertNotIn("DSML", hist[1]["content"])
+
+    @mock.patch.object(providers, "chat")
+    def test_dsml_tool_call_executed_end_to_end(self, chat_mock):
+        """DeepSeek DSML leaking into `content` (V4.1 - a space inside every
+        tag): the loop parses it, runs the round, feeds the result back, and
+        no envelope markup ever reaches chat."""
+        fd, path = tempfile.mkstemp(suffix=".txt")
+        os.close(fd)
+        with open(path, "w") as f:
+            f.write("SECRET-CONTENT-42")
+        self.addCleanup(os.unlink, path)
+        dsml = ("<｜DSML｜ calls>\n"
+                "<｜DSML｜ invoke name=\"read_file\">\n"
+                "<｜DSML｜ parameter name=\"path\" string=\"true\">" + path
+                + "</｜DSML｜ parameter>\n"
+                "</｜DSML｜ invoke>\n"
+                "</｜DSML｜ calls>")
+        chat_mock.side_effect = [("checking " + dsml, "", None),
+                                 ("the content is SECRET-CONTENT-42", "",
+                                  None)]
+        main.handle_message(self.cfg, self.tg, msg(text="read it"), self.state)
+        # round 2 carries the tool result -> the call really executed
+        second = chat_mock.call_args_list[1]
+        tool_msgs = [m for m in second[0][3] if m.get("role") == "tool"]
+        self.assertEqual(len(tool_msgs), 1)
+        self.assertIn("SECRET-CONTENT-42", tool_msgs[0]["content"])
+        # ...recorded in history as a proper tool_calls round
+        hist = self.state.get_history(100, None)
+        self.assertEqual([m["role"] for m in hist],
+                         ["user", "assistant", "tool", "assistant"])
+        self.assertEqual(hist[1]["tool_calls"][0]["function"]["name"],
+                         "read_file")
+        # nothing from the envelope reaches the user
+        self.assertEqual(self.tg.rich[-1][1],
+                         {"markdown": "the content is SECRET-CONTENT-42"})
+        for _c, t, _th in self.tg.sent:
+            self.assertNotIn("DSML", t)
+            self.assertNotIn("<invoke", t)
+
+    @mock.patch.object(providers, "chat")
     def test_round_reasoning_rides_in_context(self, chat_mock):
         """A round's reasoning is stored on its assistant message, so the
         NEXT round re-reads the model's own analysis instead of starting
@@ -1377,15 +1542,17 @@ class TestToolLoop(unittest.TestCase):
                            main._est_tokens("I should read that file."))
 
     @mock.patch.object(providers, "chat")
-    def test_no_reasoning_key_when_model_thinks_not(self, chat_mock):
-        """Provider without reasoning support: no empty key is invented."""
+    def test_reasoning_key_empty_when_model_thinks_not(self, chat_mock):
+        """No reasoning produced -> the key is still there but EMPTY (the
+        DeepSeek provider requires the key; "" is what satisfies it), and no
+        thinking text is invented."""
         chat_mock.side_effect = [("", "", [{"id": "c1", "name": "read_file",
                                             "arguments": {"path": "no.txt"}}]),
                                  ("done", "", None)]
         main.handle_message(self.cfg, self.tg, msg(text="go"), self.state)
-        hist = self.state.get_history(100, None)
-        for m in hist:
-            self.assertNotIn("reasoning_content", m)
+        for m in self.state.get_history(100, None):
+            if m.get("role") == "assistant":
+                self.assertEqual(m["reasoning_content"], "")
 
     @mock.patch.object(providers, "chat")
     def test_long_reasoning_is_tail_capped(self, chat_mock):
