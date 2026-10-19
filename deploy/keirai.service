@@ -33,6 +33,10 @@ RestartSec=3
 MemoryMax=512M
 # stop Python from buffering stdout (live logs in journalctl)
 Environment=PYTHONUNBUFFERED=1
+# last will: runs AFTER the process is gone and reports the death in the chat
+# ($SERVICE_RESULT says why). deploy/notify_stop.py - silent on clean stops,
+# rate-limited so a crash loop pings once.
+ExecStopPost=/usr/bin/python3 /home/youruser/keirai/deploy/notify_stop.py
 
 [Install]
 WantedBy=multi-user.target

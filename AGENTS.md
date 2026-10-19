@@ -38,7 +38,8 @@ keirai/
 ├── websearch.py         # Exa MCP client (web_search_exa / web_fetch_exa over streamable HTTP, stdlib)
 ├── browser.py           # Lightpanda wrapper (optional browse tool, subprocess on demand)
 ├── cli.py               # Session management CLI (list/delete/rename, no Telegram needed)
-├── deploy/keirai.service# systemd unit (keep-alive + autostart)
+├── deploy/keirai.service# systemd unit (keep-alive + autostart + ExecStopPost death notice)
+├── deploy/notify_stop.py # ExecStopPost: reports OOM/kill deaths in the chat (stdlib-only, no repo imports, rate-limited)
 ├── deploy/install_lightpanda.sh # installs the browser binary into ./tools/
 ├── config.example.toml  # Config template (TOML, comments allowed)
 └── tests/               # Unit tests (unittest, stdlib)
