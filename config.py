@@ -38,18 +38,26 @@ class Config:
         self.thinking_default = bool(data.get("thinking_default", True))
         self.rich_messages = bool(data.get("rich_messages", True))
         self.stream_drafts = bool(data.get("stream_drafts", True))
-        self.context_limit_chars = int(data.get("context_limit_chars", 120_000))
+        # auto-compact threshold, in rough tokens (was context_limit_chars -
+        # the whole report moved to tokens)
+        self.context_limit_tokens = int(data.get("context_limit_tokens", 30_000))
         # explicit only when the user actually set it in config.toml - the
         # default threshold is 100% of the model's context window (models.dev)
-        self.context_limit_explicit = "context_limit_chars" in data
+        self.context_limit_explicit = "context_limit_tokens" in data
         self.default_model = data.get("default_model", "go/mimo-v2.6-flash")
         self.topic_flow = bool(data.get("topic_flow", False))
         self.max_file_mb = int(data.get("max_file_mb", 20))
         self.tools_enabled = bool(data.get("tools_enabled", True))
         self.bash_timeout = int(data.get("bash_timeout", 30))
         self.tool_output_max_bytes = int(data.get("tool_output_max_bytes", 40_000))
-        self.parallel_api_key = (os.environ.get("PARALLEL_API_KEY")
-                                 or data.get("parallel_api_key", ""))
+        self.exa_api_key = (os.environ.get("EXA_API_KEY")
+                            or data.get("exa_api_key", ""))
+        # how the answer is streamed while it is generated:
+        #   draft - Bot API 10.1 sendRichMessageDraft (real-time animated
+        #           preview in the chat, private chats; edits elsewhere)
+        #   edit  - legacy in-place edits of a placeholder message
+        mode = str(data.get("stream_mode", "draft")).strip().lower()
+        self.stream_mode = mode if mode in ("draft", "edit") else "draft"
         self.system_prompt = data.get("system_prompt", "You are Keirai, a lightweight AI agent.")
         providers = data.get("providers", {}) or {}
         self.providers = {}

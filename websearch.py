@@ -1,23 +1,41 @@
-"""Parallel web search/fetch via the Search MCP server (streamable HTTP).
+"""Exa web search/fetch via the hosted Exa MCP server (streamable HTTP).
 
-The MCP endpoint https://search.parallel.ai/mcp is FREE and anonymous -
-it exposes exactly two tools: web_search and web_fetch. An optional API key
-(parallel_api_key / PARALLEL_API_KEY) raises the rate limits.
+The MCP endpoint https://mcp.exa.ai/mcp is free and anonymous (rate limited)
+- it exposes exactly the two tools keirai uses: web_search_exa (one query per
+call) and web_fetch_exa (batched URLs -> clean markdown). An Exa API key
+(exa_api_key / EXA_API_KEY) raises the limits; it rides on the URL the server
+itself hands out: https://mcp.exa.ai/mcp?exaApiKey=KEY.
 
 Transport: MCP streamable HTTP = JSON-RPC 2.0 POSTs; the response body is
 either plain JSON or text/event-stream (data: lines). Stdlib only.
 """
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 
-MCP_URL = "https://search.parallel.ai/mcp"
+MCP_URL = "https://mcp.exa.ai/mcp"
 PROTOCOL_VERSION = "2025-06-18"
 TIMEOUT = 60
+MAX_QUERIES = 3        # one Exa search call per query, at most this many
+RESULTS_PER_QUERY = 5  # numResults for web_search_exa
+EXCERPT_CHARS = 6000   # web_fetch_exa default is 3000 - keep more context
+FULL_CHARS = 60000     # full_content=true: as much of the page as fits
+# Exa answers a throttled search with plain text content (not isError)
+QUOTA_MARK = "rate limit"
 
 
 class MCPError(Exception):
     pass
+
+
+def endpoint(cfg=None):
+    """MCP URL, with the Exa API key appended when one is configured."""
+    key = getattr(cfg, "exa_api_key", "") if cfg is not None else ""
+    if not key:
+        return MCP_URL
+    sep = "&" if "?" in MCP_URL else "?"
+    return "%s%sexaApiKey=%s" % (MCP_URL, sep, urllib.parse.quote(key))
 
 
 class MCPClient:
@@ -96,24 +114,47 @@ def call_tool(name, arguments, api_key="", url=MCP_URL, timeout=TIMEOUT):
     text = _text_of(result)
     if result.get("isError"):
         raise MCPError(text or "tool call failed")
+    _check_quota(text)
     return text
+
+
+def _check_quota(text):
+    """Exa reports a throttled search as ordinary content, not as an error -
+    raise instead of handing the model a rate-limit notice as 'results'."""
+    if QUOTA_MARK in (text or "").lower():
+        raise MCPError(text.strip())
 
 
 # ---------------------------------------------------------------- tools
 
-def search(cfg, objective, search_queries, session_id=None):
-    args = {"objective": objective, "search_queries": search_queries}
-    if session_id:
-        args["session_id"] = str(session_id)[:100]
-    return call_tool("web_search", args, api_key=cfg.parallel_api_key)
+def search(cfg, objective, search_queries):
+    """One web_search_exa call per query (Exa takes a single natural-
+    language query), results concatenated per query. Queries that fail are
+    dropped; only an empty result set raises."""
+    url = endpoint(cfg)
+    obj = str(objective).strip()[:4000] or "the topic of the search"
+    queries = [str(q).strip() for q in (search_queries or []) if str(q).strip()]
+    queries = queries[:MAX_QUERIES]
+    if not queries:
+        raise MCPError("no search queries given")
+    out, errs = [], []
+    for q in queries:
+        try:
+            text = call_tool("web_search_exa",
+                             {"query": q, "objective": obj,
+                              "numResults": RESULTS_PER_QUERY},
+                             url=url)
+            out.append((q, text))
+        except MCPError as e:
+            errs.append(str(e))
+    if not out:
+        raise MCPError(errs[0])
+    return "\n\n".join("### %s\n%s" % (q, text) for q, text in out)
 
 
-def fetch(cfg, urls, objective=None, full_content=False, session_id=None):
-    args = {"urls": urls}
-    if objective:
-        args["objective"] = str(objective)[:200]
-    if full_content:
-        args["full_content"] = True
-    if session_id:
-        args["session_id"] = str(session_id)[:100]
-    return call_tool("web_fetch", args, api_key=cfg.parallel_api_key)
+def fetch(cfg, urls, full_content=False):
+    """One web_fetch_exa call for all URLs (batched), clean markdown back."""
+    url = endpoint(cfg)
+    args = {"urls": [str(u) for u in urls],
+            "maxCharacters": FULL_CHARS if full_content else EXCERPT_CHARS}
+    return call_tool("web_fetch_exa", args, url=url)

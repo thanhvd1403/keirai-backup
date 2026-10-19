@@ -1,6 +1,6 @@
 # Keirai configuration - TOML, comments allowed.
 # Copy to config.toml and fill in your values.
-# Env overrides: KEIRAI_BOT_TOKEN, KEIRAI_ZEN_API_KEY, KEIRAI_GO_API_KEY
+# Env overrides: KEIRAI_BOT_TOKEN, KEIRAI_ZEN_API_KEY, KEIRAI_GO_API_KEY, EXA_API_KEY
 
 bot_token = "123456:ABC-DEF..."          # from @BotFather
 
@@ -10,16 +10,19 @@ allowed_users = [42, "someusername"]
 
 thinking_default = true                  # show AI reasoning by default
 rich_messages = true                     # Bot API 10.1 rich messages (native tables, task lists); auto-falls back to regular messages on error
-stream_drafts = true                      # live streaming via sendRichMessageDraft (private chats); falls back to blocking on error
-# context_limit_chars = 120000             # optional override: auto-compact threshold in chars (default = 100% of the model's context window from models.dev)
+stream_drafts = true                      # live streaming: the thinking block is edited in place, the answer streams as a draft; falls back to blocking on error
+# stream_mode = "draft"                   # "draft" = Bot API 10.1 sendRichMessageDraft (real-time answer stream in private chats, in-place edits in groups)
+                                         # "edit"  = legacy in-place edits of a placeholder message everywhere
+# context_limit_tokens = 30000             # optional override: auto-compact threshold in tokens (default = 100% of the model's context window from models.dev)
 
 # ---- agent tools (P2)
 tools_enabled = true                     # master switch for LLM tools (files/shell/web/browser)
 bash_timeout = 30                        # default shell timeout in seconds (the agent may override per call, 1-300)
 tool_output_max_bytes = 40000            # tool output over this (bytes; 40000 = 40k ASCII chars) is saved to
                                          # sessions/<session-id>/tool_output/ - the model sees preview + path, history keeps only the path
-# parallel_api_key = ""                  # optional: raises limits on the FREE Parallel Search MCP (platform.parallel.ai);
-                                         # web_search/web_fetch work anonymously without it
+# exa_api_key = ""                      # optional: raises limits on the FREE Exa MCP (mcp.exa.ai);
+                                         # web_search/web_fetch use it anonymously (rate limited) without a key
+                                         # (env: EXA_API_KEY - get one at dashboard.exa.ai/api-keys)
 # Lightpanda browser: run `bash deploy/install_lightpanda.sh` - the browse
 # tool only appears to the model after the binary is installed in ./tools/
 default_model = "go/mimo-v2.6-flash"      # provider/model-id (Go is tried first; Zen is the error fallback)

@@ -3,6 +3,7 @@
 Chosen over python-telegram-bot/aiogram: zero dependencies, minimal RAM,
 no license questions. The Bot API is plain JSON over HTTPS.
 """
+import http.client
 import json
 import os
 import tempfile
@@ -20,6 +21,13 @@ MAX_UPLOAD = 45 * 1024 * 1024
 
 class TelegramError(Exception):
     pass
+
+
+def is_not_modified(exc):
+    """True for Telegram's 'message is not modified' - the edit we sent was
+    byte-identical to what the message already shows, i.e. a no-op, not a
+    failure (it happens when a flush fires twice with the same content)."""
+    return isinstance(exc, TelegramError) and "message is not modified" in str(exc)
 
 
 class Telegram:
@@ -42,9 +50,22 @@ class Telegram:
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", "replace")
             raise TelegramError("%s -> HTTP %d: %s" % (method, e.code, body[:300]))
-        except urllib.error.URLError as e:
-            raise TelegramError("%s -> %s" % (method, e.reason))
-        if not out.get("ok"):
+        except (urllib.error.URLError, OSError) as e:
+            # URLError covers connect failures; raw OSError covers the
+            # socket-level timeouts/resets that surface WHILE reading the
+            # body (not wrapped in URLError) - both must become
+            # TelegramError, or callers that only catch TelegramError leak
+            # and kill their thread (the poll thread dying = bot silent)
+            reason = getattr(e, "reason", None) or e
+            raise TelegramError("%s -> %s" % (method, reason))
+        except http.client.HTTPException as e:
+            # truncated/aborted responses (IncompleteRead, RemoteDisconnected
+            # on some paths) - same treatment
+            raise TelegramError("%s -> %s" % (method, e))
+        except ValueError as e:
+            # truncated/blank body -> json.loads failure
+            raise TelegramError("%s -> bad JSON: %s" % (method, e))
+        if not isinstance(out, dict) or not out.get("ok"):
             raise TelegramError("%s -> %s" % (method, out))
         return out["result"]
 
@@ -56,7 +77,9 @@ class Telegram:
     def get_updates(self, offset=None):
         payload = {
             "timeout": POLL_TIMEOUT,
-            "allowed_updates": ["message"],
+            # stopped_message_generation = the user pressed the native Stop
+            # button Telegram shows under a streamed draft (can_stop)
+            "allowed_updates": ["message", "stopped_message_generation"],
         }
         if offset is not None:
             payload["offset"] = offset
@@ -84,13 +107,25 @@ class Telegram:
             payload["message_thread_id"] = thread_id
         return self.call("sendRichMessage", payload, timeout=60)
 
-    def send_rich_draft(self, chat_id, draft_id, markdown=None, html=None, thread_id=None):
-        """Bot API 10.1 streaming draft: ephemeral ~30s preview, private chats
-        only. Reusing draft_id animates updates. Finalize with send_rich."""
+    # NOTE: streaming uses sendRichMessageDraft (Bot API 10.1) - a preview
+    # rendered IN THE CHAT. Its predecessor sendMessageDraft (9.3) lands in
+    # the USER's composer and blocks them from typing and sending while the
+    # bot generates (bugs.telegram.org/c/62189) - never call that one.
+
+    def send_rich_draft(self, chat_id, draft_id, markdown=None, html=None,
+                        thread_id=None, can_stop=False):
+        """Bot API 10.1 sendRichMessageDraft: stream a partial rich message
+        while it is being generated. The draft is an ephemeral ~30s preview
+        (re-sending the same draft_id animates it in place) - the final
+        message must still be sent with sendRichMessage. Private chats only.
+        `can_stop=True` shows Telegram's own Stop button."""
         rich = {"markdown": markdown} if markdown is not None else {"html": html}
-        payload = {"chat_id": chat_id, "draft_id": draft_id, "rich_message": rich}
+        payload = {"chat_id": chat_id, "draft_id": draft_id,
+                   "rich_message": rich}
         if thread_id:
             payload["message_thread_id"] = thread_id
+        if can_stop:
+            payload["can_stop"] = True
         return self.call("sendRichMessageDraft", payload, timeout=30)
 
     def edit_rich(self, chat_id, message_id, markdown=None, html=None):
@@ -101,7 +136,11 @@ class Telegram:
         return self.call("editMessageText", payload, timeout=30)
 
     def delete_message(self, chat_id, message_id):
-        return self.call("delete_message", {"chat_id": chat_id, "message_id": message_id})
+        # NOTE: the Bot API method is deleteMessage (camelCase) - a snake
+        # case name is a 404 "Not Found", which silently broke every cleanup
+        # that relied on it (stale live messages were never deleted)
+        return self.call("deleteMessage", {"chat_id": chat_id,
+                                           "message_id": message_id})
 
     def typing(self, chat_id, thread_id=None):
         payload = {"chat_id": chat_id, "action": "typing"}

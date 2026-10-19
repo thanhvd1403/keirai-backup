@@ -35,7 +35,7 @@ keirai/
 ├── providers.py         # OpenCode Zen/Go clients (blocking + streaming), usage capture, models.dev metadata + pricing cache
 ├── sessions.py          # SQLite session store (history, models, topics, session meta: ids + cost/token accumulators)
 ├── tools.py             # LLM tool registry: files, shell (blacklist+timeout), dispatch
-├── websearch.py         # Parallel Search MCP client (free web_search/web_fetch, stdlib HTTP)
+├── websearch.py         # Exa MCP client (web_search_exa / web_fetch_exa over streamable HTTP, stdlib)
 ├── browser.py           # Lightpanda wrapper (optional browse tool, subprocess on demand)
 ├── cli.py               # Session management CLI (list/delete/rename, no Telegram needed)
 ├── deploy/keirai.service# systemd unit (keep-alive + autostart)
@@ -46,8 +46,9 @@ keirai/
     ├── test_config.py   #   config loading, access control
     ├── test_providers.py#   provider parsing, usage capture, models.dev metadata, cost math, cache, session header
     ├── test_tools.py     #   tool specs, file ops, shell safety/interrupt
-    ├── test_websearch.py #   MCP client parsing, handshake, tool args
+    ├── test_websearch.py #   Exa MCP client: parsing, handshake, search/fetch args, quota guard
     ├── test_browser.py   #   lightpanda discovery + subprocess wrapper
+    ├── test_telegram.py  #   Bot API wire format: method names, payloads, allowed_updates
     └── test_main.py      #   routing, commands, sessions, streaming, compaction, CLI,
                           #   tool loop, /stop, reply-to, edit-mode streaming,
                           #   /context, /cost, provider fallback, usage accounting
@@ -57,18 +58,19 @@ Run tests: `python -m unittest discover -s tests`
 
 ## Current Status
 
-P0 + P1 + P2 + P3 + P4 complete and tested (241 tests). The bot does:
+P0 + P1 + P2 + P3 + P4 complete and tested (293 tests). The bot does:
 - Long polling with access control (allow-list by user ID/username, or allow all)
 - Config in TOML (`config.toml`, comments allowed) with env overrides
 - AI chat via OpenCode Zen / OpenCode Go (OpenAI-compatible), history persisted per session in SQLite
 - Sessions via Telegram topics (Bot API 9.3+ private-chat topics - enable "Threaded mode" in the @BotFather Mini App): `/new [name]`, `/rename <name>`, per-topic context isolation; `/reset-all` wipes everything (2-string confirmation, deletes tracked topics)
 - AI answers sent as Bot API 10.1 Rich Messages: markdown passthrough (native tables, task lists, headings, formulas, 32k chars), thinking as collapsible `<details>`; `rich_messages` config toggle + automatic fallback to regular messages
-- Live streaming in private chats via `sendRichMessageDraft` (reasoning as `<tg-thinking>`, then answer tokens; `stream_drafts` toggle, falls back to blocking)
+- Live streaming: the **thinking block streams by editing ONE message in place** (created on the first reasoning delta, edited until the round ends - reasoning that arrives between answer chunks keeps editing the same block, and a tool round turns it into the permanent block instead of sending a second one); the **answer streams through `sendRichMessageDraft`** (Bot API 10.1: animated preview in the chat, native Stop button -> `stopped_message_generation` -> same interrupt as /stop) in private chats, and through in-place edits of a message of its own below the thinking where drafts are not allowed (groups) or with `stream_mode = "edit"`; `stream_drafts` on/off, automatic fallback to a blocking call on any error. The draft is ephemeral, so the finished answer is persisted with `sendRichMessage` at the end. It is `sendRichMessageDraft`, never `sendMessageDraft` - the latter lands in the *user's* composer and blocks them from typing/sending (bugs.telegram.org/c/62189)
 - Session persistence in SQLite (`sessions.db`): history, per-session model, topic registry - survives restarts; `/delete` clears one session's context
-- Context window management: `/context` shows used/max against the model's **real context window** (models.dev tokens, chars shown too); auto-compact fires at **100% of that window** by default (`context_limit_chars` in config.toml overrides); `/compact` manual (summarize older messages, keep last 4)
+- Context window management: `/context` shows used/max against the model's **real context window** (models.dev tokens) plus the message count; auto-compact fires at **100% of that window** by default (`context_limit_tokens` in config.toml overrides); `/compact` manual (summarize older messages, keep last 4)
+- **No message cap**: the whole session history is sent on every call (`_prompt()`) - auto-compact alone bounds size (send everything, summarize when it gets big); the one exception is base64 images: only the newest `IMAGE_KEEP` (4) image-bearing messages re-send theirs, older pictures become a marker in the *prompt* (stored history keeps them). Compaction is hardened to be that sole bound: the summary transcript is capped at ~1/8 of the window (newest older messages first), and if summarizing still fails while the window is genuinely full, the oldest are dropped to ~half the window (`COMPACT_FALLBACK_KEEP` = 6 floor) - a last resort, never normal operation
 - CLI: `python cli.py list|delete|rename` for session admin without Telegram
-- Agent tools (OpenAI function-calling, `tools.py`): `read_file`/`write_file`/`edit_file`, `bash` (destructive-command blacklist, agent-settable 1-300s timeout), `web_search`/`web_fetch` (Parallel Search MCP - free, no key), optional `browse` (Lightpanda, install via `deploy/install_lightpanda.sh` -> `./tools/lightpanda`)
-- Tool rounds (input + results) persist in session history - the next turn carries them, so no re-reading the same file every message; failed/interrupted rounds stay too (unanswered calls get a "[not executed...]" placeholder). Output over `tool_output_max_bytes` (default 40 KB) spills to `sessions/<session-id>/tool_output/` - model sees preview + path, history keeps only the path
+- Agent tools (OpenAI function-calling, `tools.py`): `read_file`/`write_file`/`edit_file`, `bash` (destructive-command blacklist, agent-settable 1-300s timeout), `web_search`/`web_fetch` (**Exa MCP** - one `web_search_exa` call per query, batched `web_fetch_exa`; free anonymous tier, `exa_api_key` raises the limit), optional `browse` (Lightpanda, install via `deploy/install_lightpanda.sh` -> `./tools/lightpanda`)
+- Tool rounds (input + results) persist in session history - the next turn carries them, so no re-reading the same file every message; failed/interrupted rounds stay too (unanswered calls get a "[not executed...]" placeholder). Output over `tool_output_max_bytes` (default 40 KB) spills to `sessions/<session-id>/tool_output/` - model sees preview + path, history keeps only the path; text-form tool calls in an answer (model bypassed the tools API) are parsed by `textcalls.recover()` and executed as a normal round instead of being delivered raw to chat
 - Tool rounds run in-turn **uncapped** (`/stop` interrupts a runaway turn); each turn logs `tool round N: X call(s)` and `turn done: ... tool_rounds=...`
 - `/stop` interrupts a running reply/tool: an update-watcher thread owns getUpdates, intercepts /stop mid-turn, kills running `bash`, and records a neutral "[This run was interrupted by the user...]" marker in context
 - Concurrent sessions: a dispatcher gives each session (chat + topic) its own worker - a turn in one topic never blocks another topic's messages or commands; a plain message sent while your own session is mid-turn is folded into context at the next tool boundary (marked "[sent while you were working...]") so you can steer without `/stop`; every round's reasoning is shown live as its own collapsible block (`/thinking off` hides)
@@ -79,11 +81,11 @@ P0 + P1 + P2 + P3 + P4 complete and tested (241 tests). The bot does:
 - `/models` lists models with context/cost stats from **models.dev** (OpenCode's own catalog, daily sync to `cache/models_meta.json`); `/model provider/id` switches models
 - **Go-first inference**: default model `go/mimo-v2.6-flash`; on a provider error the call retries once on the other provider when it has a key AND its catalog serves the model
 - **Usage accounting**: each call's `usage` (blocking + streaming) accumulates per session in `sessions.db` (`session_meta`: id `yyyymmdd-hhmm-4hex`, tokens in/out/cached, notional cost with cached-read discount)
-- `/context` and `/cost` add session name/id/model, token totals (in/out/cached) - `/cost` also shows the session's notional cost
+- `/context` and `/cost` are two names for ONE report (same handler): session name/id/model, rough tokens used vs the model's **real context window** (models.dev), message count (every stored message - user, agent and tool call/result), the auto-compact threshold in tokens, token totals (in/out/cached) and the session's notional cost - **no character counts anywhere**: `[A-Za-z0-9]` ~4 chars/token, every other character (space/punctuation/CJK/emoji) 1 token each, system prompt included, tool calls+results counted like any other message
 - **Topic flow** (`/topic`, persisted in `config.toml`): entry needs Threaded mode ON **and** "Disallow users to create topics" ON (checked live via getMe, typed confirmation); while ON, All takes commands only (session-scoped rejected with a hint, `/model global` allowed) and every topic message needs a bound session (unbound -> rejection hint)
 - `/session [page N | N | <id>]`: lists sessions (name/id/timestamp/preview, last-active first, current excluded) and switches them; topic-flow switches go through typed per-slot prompts (switch-here / create-new / ping / do-nothing) with dead-topic ping recovery
 - Sessions move between **slots** (`thread_id` >0 = bound to that topic, main chat = None, negative = parked/unbound); `/new` creates a topic+bound session in topic flow, or parks the old session and starts blank in normal flow
-- **Agent titles**: the model title is generated *concurrently with the reply* (JSON-constrained call, OpenCode-style prompt) and applied after delivery - **one rename per session, no retries**; on timeout/fault a derived fallback (first line ~48 chars, media placeholder) sticks; faulty output (tool-call text, >12-word answers) is rejected, never truncated; provenance `derived < llm < user`; media-only messages named from the media; `/rename` mirrors session+topic
+- **Agent titles**: the rename happens **before the message reaches the model** - the JSON-constrained title call (OpenCode-style prompt) is joined first (`TITLE_WAIT` = 10s), then the reply is generated under that name; **one rename per session, no retries**; past the wait or on fault a derived fallback (first line ~48 chars, media placeholder) sticks - still applied before the reply; faulty output (tool-call text, >12-word answers) is rejected, never truncated; provenance `derived < llm < user`; media-only messages named from the media; `/rename` mirrors session+topic
 - Photos -> vision models; media round-trip test via caption `media_test`
 - Logging: stderr + `logs/keirai.log` (rotating)
 
@@ -93,7 +95,8 @@ Not implemented yet: P5 (custom OpenAI-compatible providers, interactive setup s
 
 - Keirai code: AGPLv3 (LICENSE)
 - Lightpanda browser (optional tool): **AGPLv3** - same license, compatible; invoked as a separate process, never linked
-- Parallel Search MCP: commercial service with a free anonymous tier; we only make REST calls (no license implications)
+- **Exa MCP** (mcp.exa.ai): hosted service with a free anonymous tier (rate limited; an `exa_api_key` raises it); we only make REST calls (no license implications)
+- Telegram Bot API (sendRichMessageDraft / sendRichMessage / editMessageText): plain HTTPS calls from our own code, no client library (no license implications)
 
 ## License
 

@@ -279,5 +279,46 @@ class TestMultipart(unittest.TestCase):
                 t.send_media(1, "document", __file__)
 
 
+class TestTransportMapping(unittest.TestCase):
+    """urlopen only wraps send-phase failures in URLError: a timeout/reset
+    while READING the response body escapes as a bare OSError. Everything
+    the chat callers catch must arrive as ProviderError - otherwise the
+    Go->Zen fallback never fires and the turn dies with a raw exception."""
+
+    def test_read_timeout_becomes_provider_error(self):
+        with mock.patch("providers.urllib.request.urlopen",
+                        side_effect=TimeoutError("The read operation timed out")):
+            with self.assertRaises(providers.ProviderError) as cm:
+                providers._request("https://x/v1/chat/completions", "key",
+                                   {"a": 1})
+        self.assertIn("timed out", str(cm.exception))
+
+    def test_connection_reset_becomes_provider_error(self):
+        with mock.patch("providers.urllib.request.urlopen",
+                        side_effect=ConnectionResetError(
+                            104, "Connection reset by peer")):
+            with self.assertRaises(providers.ProviderError):
+                providers._request("https://x/v1/chat/completions", "key",
+                                   {"a": 1})
+
+    def test_truncated_json_becomes_provider_error(self):
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return b'{"choices": ['
+
+        with mock.patch("providers.urllib.request.urlopen",
+                        return_value=_Resp()):
+            with self.assertRaises(providers.ProviderError) as cm:
+                providers._request("https://x/v1/chat/completions", "key",
+                                   {"a": 1})
+        self.assertIn("bad response", str(cm.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

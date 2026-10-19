@@ -1,11 +1,17 @@
 """Tests for the agent tool registry: files, shell safety, dispatch."""
 import os
+import shlex
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
 import config as config_mod
 import tools
+
+# interpreter for the shell tests: `python` is not on every PATH (only
+# python3), which fails these with exit 127 before they test anything
+PY = shlex.quote(sys.executable)
 
 
 def make_config(**kw):
@@ -16,11 +22,15 @@ def make_config(**kw):
 
 class TestSpecs(unittest.TestCase):
     def test_core_specs_present(self):
-        names = [s["function"]["name"] for s in tools.available_specs(make_config())]
+        # pinned off: whether the binary is installed is machine state -
+        # test_browse_appears_when_installed covers the positive case
+        with mock.patch.object(tools.browser, "find_binary", return_value=None):
+            names = [s["function"]["name"]
+                     for s in tools.available_specs(make_config())]
         for n in ("read_file", "write_file", "edit_file", "bash",
                   "web_search", "web_fetch"):
             self.assertIn(n, names)
-        self.assertNotIn("browse", names)  # binary not installed here
+        self.assertNotIn("browse", names)
 
     def test_tools_disabled(self):
         cfg = make_config(tools_enabled=False)
@@ -119,7 +129,7 @@ class TestBash(unittest.TestCase):
 
     def test_timeout(self):
         out = tools.execute(self.cfg, "bash", {
-            "command": "python -c \"import time; time.sleep(10)\"",
+            "command": "%s -c \"import time; time.sleep(10)\"" % PY,
             "timeout_seconds": 1})
         self.assertIn("TIMED OUT", out)
 
@@ -131,7 +141,7 @@ class TestBash(unittest.TestCase):
             return calls["n"] >= 2
 
         out = tools.execute(self.cfg, "bash", {
-            "command": "python -c \"import time; time.sleep(10)\"",
+            "command": "%s -c \"import time; time.sleep(10)\"" % PY,
             "timeout_seconds": 60},
             ctx={"interrupt": stop})
         self.assertIn("INTERRUPTED by the user", out)
@@ -146,7 +156,7 @@ class TestBash(unittest.TestCase):
                 path=os.path.join(td, "config.toml"))
             ctx = {"spill_session": "20261001-1200-ab12"}
             out = tools.execute(cfg, "bash", {
-                "command": "python -c \"print('z' * 500)\""}, ctx=ctx)
+                "command": "%s -c \"print('z' * 500)\"" % PY}, ctx=ctx)
             self.assertIn("output truncated", out)
             self.assertIn("read_file", out)
             self.assertTrue(out.startswith("exit code 0"))  # head preview

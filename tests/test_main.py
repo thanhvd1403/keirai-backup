@@ -14,9 +14,9 @@ class FakeTG:
     def __init__(self):
         self.sent = []
         self.rich = []       # (chat_id, {"markdown"|"html": src}, thread_id)
-        self.drafts = []     # (chat_id, draft_id, src, thread_id)
         self.edits = []      # (chat_id, message_id, src)
         self.deleted = []    # (chat_id, message_id)
+        self.drafts = []     # (chat_id, draft_id, src, thread_id, can_stop)
         self.media = []
         self.file_bytes = b"fakeimage"
         self.topics = {}     # name -> thread_id
@@ -41,9 +41,12 @@ class FakeTG:
         self.rich.append((chat_id, src, thread_id))
         return {"message_id": 1000 + len(self.rich)}
 
-    def send_rich_draft(self, chat_id, draft_id, markdown=None, html=None, thread_id=None):
+    def send_rich_draft(self, chat_id, draft_id, markdown=None, html=None,
+                        thread_id=None, can_stop=False):
+        """Bot API 10.1 sendRichMessageDraft: the answer's real-time stream
+        (an ephemeral preview in the chat - never the user's composer)."""
         src = {"markdown": markdown} if markdown is not None else {"html": html}
-        self.drafts.append((chat_id, draft_id, src, thread_id))
+        self.drafts.append((chat_id, draft_id, src, thread_id, can_stop))
         return True
 
     def edit_rich(self, chat_id, message_id, markdown=None, html=None):
@@ -87,7 +90,7 @@ def make_config(**kw):
     base = {"bot_token": "t", "allowed_users": [42],
             "rich_messages": True, "stream_drafts": False,
             # explicit -> default tests never hit models.dev for thresholds
-            "context_limit_chars": 120_000,
+            "context_limit_tokens": 30_000,
             "providers": {"zen": {"api_key": "zk"}, "go": {"api_key": "gk"}}}
     base.update(kw)
     return config_mod.Config(base)
@@ -502,7 +505,7 @@ class TestCompact(unittest.TestCase):
         self.assertIn("[Summary of earlier conversation]", hist[0]["content"])
         self.assertIn("THE SUMMARY", hist[0]["content"])
         self.assertEqual(hist[-1]["content"][:9], "message 9")
-        self.assertIn("compacted: 10 -> 6", self.tg.sent[-1][1])
+        self.assertIn("compacted: 10 -> 6 messages (~", self.tg.sent[-1][1])
 
     def test_compact_nothing_to_do(self):
         self._seed(3)
@@ -512,7 +515,7 @@ class TestCompact(unittest.TestCase):
     @mock.patch.object(providers, "chat",
                        side_effect=[("SUMMARY", "", None), ("final answer", "", None)])
     def test_auto_compact_on_limit(self, chat_mock):
-        self.cfg = make_config(context_limit_chars=100)
+        self.cfg = make_config(context_limit_tokens=100)
         hist = self._seed(8)
         main.handle_message(self.cfg, self.tg, msg(text="continue"), self.state)
         hist = self.state.get_history(100, None)
@@ -526,7 +529,7 @@ class TestCompact(unittest.TestCase):
     def test_auto_compact_fires_at_full_window(self, chat_mock, price_mock):
         """Integration: history past the model's window (default threshold =
         100%) triggers compaction without any explicit config."""
-        price_mock.return_value = {"context": 300}  # 300 tokens = 1,200 chars
+        price_mock.return_value = {"context": 300}  # a 300-token model window
         cfg = make_config()
         cfg.context_limit_explicit = False  # as if the key is absent
         chat_mock.side_effect = [("SUMMARY", "", None),
@@ -544,7 +547,7 @@ class TestCompact(unittest.TestCase):
 
 class TestCompactThreshold(unittest.TestCase):
     """Auto-compact threshold: 100% of the model window by default;
-    explicit context_limit_chars overrides; missing metadata falls back."""
+    explicit context_limit_tokens overrides; missing metadata falls back."""
 
     def setUp(self):
         self.tg = FakeTG()
@@ -556,13 +559,13 @@ class TestCompactThreshold(unittest.TestCase):
         price_mock.return_value = {"context": 1048576}
         cfg = make_config()
         cfg.context_limit_explicit = False  # as if the key is absent
-        self.assertEqual(main._compact_limit_chars(cfg, "go/mimo-v2.6-flash"),
-                         1048576 * main.CHARS_PER_TOKEN)
+        self.assertEqual(main._compact_limit_tokens(cfg, "go/mimo-v2.6-flash"),
+                         1048576)
 
     @mock.patch.object(providers, "price_for")
     def test_explicit_config_value_wins(self, price_mock):
-        cfg = make_config(context_limit_chars=100)
-        self.assertEqual(main._compact_limit_chars(cfg, "go/mimo-v2.6-flash"),
+        cfg = make_config(context_limit_tokens=100)
+        self.assertEqual(main._compact_limit_tokens(cfg, "go/mimo-v2.6-flash"),
                          100)
         price_mock.assert_not_called()
 
@@ -570,33 +573,360 @@ class TestCompactThreshold(unittest.TestCase):
     def test_no_metadata_falls_back_to_config(self, price_mock):
         cfg = make_config()
         cfg.context_limit_explicit = False
-        self.assertEqual(main._compact_limit_chars(cfg, "go/unknown-model"),
-                         120_000)
+        self.assertEqual(main._compact_limit_tokens(cfg, "go/unknown-model"),
+                         30_000)
 
 
 class TestStreaming(unittest.TestCase):
     def setUp(self):
         self.tg = FakeTG()
         self.state = main.State(True)
+        self.cfg = make_config()
         disable_titles(self)
 
     @mock.patch.object(providers, "chat_stream")
-    def test_stream_drafts_then_final(self, stream_mock):
-        self.cfg = make_config(stream_drafts=True)
+    def test_stream_thinking_edit_in_place_answer_as_draft(self, stream_mock):
+        """Private-chat streaming (stream_mode = "draft"): the thinking
+        block is ONE message edited in place while the model reasons, and
+        the answer streams through sendRichMessageDraft - Telegram's modern
+        streaming API (an animated preview in the chat, can_stop button),
+        never a message that gets rewritten delta by delta. The draft is
+        ephemeral, so the finished answer is sent for real at the end."""
+        self.cfg = make_config(stream_drafts=True, stream_mode="draft")
         stream_mock.return_value = iter([
-            ("reasoning", "thinking hard..."),
+            ("reasoning", "think"),
+            ("reasoning", "ing more"),
             ("content", "hello "),
             ("content", "**world**"),
         ])
-        main.handle_message(self.cfg, self.tg, msg(text="hi"), self.state)
-        # live draft shown (first delta flushes immediately)
-        self.assertTrue(self.tg.drafts)
-        self.assertIn("<tg-thinking>", self.tg.drafts[0][2]["html"])
-        # final rich message with full answer markdown
-        self.assertEqual(self.tg.rich[-1][1], {"markdown": "hello **world**"})
+        # fake clock: every delta sees >1.5s elapsed, so each one flushes
+        clock = {"t": 1000.0}
+
+        def fake_time():
+            clock["t"] += 10.0
+            return clock["t"]
+
+        with mock.patch.object(main.time, "time", fake_time):
+            main.handle_message(self.cfg, self.tg, msg(text="hi"), self.state)
+        rich = [s for _c, s, _t in self.tg.rich]
+        # exactly TWO messages ever created: ONE thinking block + the final
+        # answer (the draft never becomes a message while streaming)
+        self.assertEqual(len(rich), 2)
+        self.assertEqual(len([s for s in rich if "html" in s]), 1)
+        self.assertIn("<details>", rich[0]["html"])
+        self.assertEqual(rich[1], {"markdown": "hello **world**"})
+        # the thinking streamed by editing ITS message in place...
+        self.assertIn("thinking more", self.tg.edits[0][2].get("html", ""))
+        self.assertTrue(all(mid == 1000 + 1
+                            for _c, mid, _s in self.tg.edits))  # one block
+        # ...and the answer streamed as a draft: same draft id (animated),
+        # can_stop -> Telegram's native Stop button
+        drafts = [s for _c, _d, s, _t, _cs in self.tg.drafts]
+        self.assertEqual(drafts[0], {"markdown": "hello "})
+        self.assertEqual(drafts[-1], {"markdown": "hello **world**"})
+        self.assertEqual(len({d for _c, d, _s, _t, _cs in self.tg.drafts}), 1)
+        self.assertTrue(all(cs for _c, _d, _s, _t, cs in self.tg.drafts))
+        # final delivery: the thinking block edited in place (full text),
+        # the answer persisted with sendRichMessage - no second block
+        self.assertIn("thinking more", self.tg.edits[-1][2].get("html", ""))
         # history has exactly one user + one assistant turn
         hist = self.state.get_history(100, None)
         self.assertEqual([m["role"] for m in hist], ["user", "assistant"])
+
+    @mock.patch.object(providers, "chat_stream")
+    def test_interleaved_reasoning_stays_in_the_thinking_block(self, stream_mock):
+        """A model that keeps thinking BETWEEN answer chunks must not leak
+        thought text into the answer (it used to read as a second thinking
+        block), and the thinking block must not freeze half-finished."""
+        stream_mock.return_value = iter([
+            ("reasoning", "first thoughts"),
+            ("content", "part one "),
+            ("reasoning", " ...and second thoughts"),
+            ("content", "part two"),
+        ])
+        clock = {"t": 1000.0}
+
+        def fake_time():
+            clock["t"] += 10.0
+            return clock["t"]
+
+        with mock.patch.object(main.time, "time", fake_time):
+            main.handle_message(make_config(stream_drafts=True), self.tg,
+                                msg(text="hi"), self.state)
+        # the answer carries ONLY content deltas
+        self.assertEqual([s for _c, _d, s, _t, _cs in self.tg.drafts][-1],
+                         {"markdown": "part one part two"})
+        self.assertIn({"markdown": "part one part two"},
+                      [s for _c, s, _t in self.tg.rich])
+        # ONE thinking block, edited in place with the whole reasoning
+        htmls = [s["html"] for _c, s, _t in self.tg.rich if "html" in s]
+        self.assertEqual(len(htmls), 1)
+        self.assertIn("and second thoughts", self.tg.edits[-1][2].get("html", ""))
+        # and the persisted history keeps thinking out of the answer
+        hist = self.state.get_history(100, None)
+        self.assertEqual(hist[-1]["content"], "part one part two")
+
+    @staticmethod
+    def _not_modified():
+        """Telegram's no-op answer: the edit was identical to the message."""
+        return main.tg_mod.TelegramError(
+            "editMessageText -> HTTP 400: {\"ok\":false,\"error_code\":400,"
+            "\"description\":\"Bad Request: message is not modified: "
+            "specified new message content and reply markup are exactly the "
+            "same as a current content and reply markup of the message\"}")
+
+    @mock.patch.object(providers, "chat_stream")
+    def test_noop_edit_does_not_kill_the_stream(self, stream_mock):
+        """'message is not modified' means our flush repeated unchanged
+        content - a no-op, not a failure. It used to disable live updates
+        for the rest of the turn (stream froze mid-answer)."""
+        stream_mock.return_value = iter([
+            ("reasoning", "thinking"),   # delta 1 -> block created
+            ("content", "hello"),        # delta 2 -> thinking edit = no-op
+            ("content", " world"),       # delta 3 -> same
+        ])
+        tg = FakeTG()
+        real_edit = FakeTG.edit_rich
+
+        def noop_on_html(chat_id, message_id, markdown=None, html=None):
+            if html is not None:  # every thinking flush repeats the same text
+                raise self._not_modified()
+            return real_edit(tg, chat_id, message_id, markdown=markdown,
+                             html=html)
+
+        tg.edit_rich = noop_on_html
+        clock = {"t": 1000.0}
+
+        def fake_time():
+            clock["t"] += 10.0
+            return clock["t"]
+
+        with self.assertLogs("keirai", level="INFO") as cm:
+            with mock.patch.object(main.time, "time", fake_time):
+                main.handle_message(make_config(stream_drafts=True), tg,
+                                    msg(text="hi"), self.state)
+        self.assertFalse(any("live updates disabled" in line
+                             for line in cm.output))
+        # the stream kept running: one thinking block, answer delivered
+        self.assertEqual(len([s for _c, s, _t in tg.rich if "html" in s]), 1)
+        self.assertIn({"markdown": "hello world"},
+                      [s for _c, s, _t in tg.rich])
+        self.assertTrue(tg.drafts)  # answer streamed after the no-op edits
+
+    @mock.patch.object(providers, "chat_stream")
+    def test_noop_thinking_edit_does_not_duplicate_the_block(self, stream_mock):
+        """When the round's thinking already equals the final block the edit
+        is a no-op - the block is DONE. Falling back to a plain send there
+        put a duplicate block next to the streamed one (and leaked raw HTML
+        into a normal message)."""
+        fd, path = tempfile.mkstemp(suffix=".txt")
+        os.close(fd)
+        with open(path, "w") as f:
+            f.write("DATA")
+        self.addCleanup(os.unlink, path)
+        stream_mock.side_effect = [
+            iter([("reasoning", "checking"),
+                  ("tool_calls", [{"id": "c1", "name": "read_file",
+                                   "arguments": {"path": path}}])]),
+            iter([("reasoning", "all done"), ("content", "the answer")]),
+        ]
+        tg = FakeTG()
+        real_edit = FakeTG.edit_rich
+
+        def noop_on_html(chat_id, message_id, markdown=None, html=None):
+            if html is not None:
+                raise self._not_modified()
+            return real_edit(tg, chat_id, message_id, markdown=markdown,
+                             html=html)
+
+        tg.edit_rich = noop_on_html
+        clock = {"t": 1000.0}
+
+        def fake_time():
+            clock["t"] += 10.0
+            return clock["t"]
+
+        with mock.patch.object(main.time, "time", fake_time):
+            main.handle_message(make_config(stream_drafts=True), tg,
+                                msg(text="read it"), self.state)
+        # ONE block per round, nothing deleted, and neither round's
+        # reasoning leaked into a plain message (that was the old
+        # 'falling back' duplicate-block path)
+        self.assertEqual(len([s for _c, s, _t in tg.rich if "html" in s]), 2)
+        self.assertFalse(any("checking" in t or "all done" in t
+                             for _c, t, _th in tg.sent))
+        self.assertEqual(tg.deleted, [])
+
+    @mock.patch.object(providers, "chat_stream")
+    def test_noop_final_edit_keeps_the_messages(self, stream_mock):
+        """Final delivery with unchanged content must not delete the streamed
+        messages and re-send them - the no-op edit IS the delivery."""
+        stream_mock.return_value = iter([("reasoning", "hmm"),
+                                         ("content", "hello world")])
+        tg = FakeTG()
+        tg.edit_rich = lambda *a, **k: (_ for _ in ()).throw(
+            self._not_modified())
+        g = {"id": 100, "type": "supergroup"}
+        with self.assertLogs("keirai", level="INFO") as cm:
+            with mock.patch.object(main.time, "time", lambda: 1000.0):
+                main.handle_message(make_config(stream_drafts=True), tg,
+                                    msg(text="hi", chat=g), self.state)
+        self.assertEqual(tg.deleted, [])          # kept, not re-created
+        self.assertEqual(len(tg.rich), 2)         # nothing sent twice
+        self.assertFalse(any("final live edit failed" in line
+                             for line in cm.output))
+
+    @mock.patch.object(providers, "chat_stream")
+    def test_blank_answer_is_never_sent_rich(self, stream_mock):
+        """A whitespace-only flush used to reach Telegram as
+        RICH_MESSAGE_EMPTY (HTTP 400) and kill live updates for the turn."""
+        stream_mock.return_value = iter([("content", "\n"),
+                                         ("content", "ok")])
+        clock = {"t": 1000.0}
+
+        def fake_time():
+            clock["t"] += 10.0
+            return clock["t"]
+
+        with mock.patch.object(main.time, "time", fake_time):
+            main.handle_message(make_config(stream_drafts=True), self.tg,
+                                msg(text="hi"), self.state)
+        for _c, _d, s, _t, _cs in self.tg.drafts:
+            self.assertTrue((s.get("markdown") or "").strip())
+        for _c, s, _t in self.tg.rich:
+            if "markdown" in s:
+                self.assertTrue(s["markdown"].strip())
+        self.assertIn({"markdown": "ok"}, [s for _c, s, _t in self.tg.rich])
+
+    @mock.patch.object(providers, "chat_stream")
+    def test_group_stream_edits_two_messages(self, stream_mock):
+        """Groups stream exactly like private chats: thinking message +
+        answer message, both edited in place (no drafts anywhere)."""
+        stream_mock.return_value = iter([
+            ("reasoning", "hmm"),
+            ("content", "hello "),
+            ("content", "**world**"),
+        ])
+        clock = {"t": 1000.0}
+
+        def fake_time():
+            clock["t"] += 10.0
+            return clock["t"]
+
+        with mock.patch.object(main.time, "time", fake_time):
+            main.handle_message(make_config(stream_drafts=True), self.tg,
+                                msg(text="hi", chat={"id": 100, "type": "supergroup"}),
+                                self.state)
+        # created ONCE (html thinking + markdown answer), then only edited
+        html_msgs = [s for _c, s, _t in self.tg.rich if "html" in s]
+        self.assertEqual(len(html_msgs), 1)
+        self.assertEqual(len(self.tg.rich), 2)
+        self.assertIn({"markdown": "hello **world**"},
+                      [s for _c, _mid, s in self.tg.edits])
+
+    @mock.patch.object(providers, "chat_stream")
+    def test_tool_round_keeps_one_thinking_block_per_round(self, stream_mock):
+        """A tool round turns the streamed thinking into THE block: the
+        streamed message is edited into its final form (never re-sent, so
+        there is no second, half-finished block next to it), and the next
+        round streams into fresh messages BELOW the tool lines."""
+        fd, path = tempfile.mkstemp(suffix=".txt")
+        os.close(fd)
+        with open(path, "w") as f:
+            f.write("DATA")
+        self.addCleanup(os.unlink, path)
+        stream_mock.side_effect = [
+            iter([("reasoning", "checking"),
+                  ("tool_calls", [{"id": "c1", "name": "read_file",
+                                   "arguments": {"path": path}}])]),
+            iter([("reasoning", "all done"),
+                  ("content", "the answer")]),
+        ]
+        clock = {"t": 1000.0}
+
+        def fake_time():
+            clock["t"] += 10.0
+            return clock["t"]
+
+        with mock.patch.object(main.time, "time", fake_time):
+            main.handle_message(make_config(stream_drafts=True), self.tg,
+                                msg(text="read it"), self.state)
+        # exactly ONE thinking message per round (2 total), nothing deleted:
+        # round 1's streamed block became the permanent block in place
+        self.assertEqual(len([s for _c, s, _t in self.tg.rich
+                              if "html" in s]), 2)
+        self.assertEqual(self.tg.deleted, [])
+        edits = [(mid, s) for _c, mid, s in self.tg.edits]
+        self.assertTrue(any(mid == 1000 + 1 and "checking" in s.get("html", "")
+                            for mid, s in edits))
+        # rich sends: round 1 thinking | round 2 thinking | the answer
+        # (drafts are ephemeral -> persisted once at the end)
+        self.assertEqual(len(self.tg.rich), 3)
+        self.assertEqual(self.tg.rich[-1][1], {"markdown": "the answer"})
+        self.assertIn("all done", edits[-1][1].get("html", ""))  # r2 block
+        self.assertEqual(edits[-1][0], 1000 + 2)
+        self.assertTrue(self.tg.drafts)  # round 2's answer streamed live
+
+    @mock.patch.object(providers, "chat_stream")
+    def test_tool_round_drops_answer_view_keeps_thinking(self, stream_mock):
+        """Edit mode (groups, no drafts): the round's answer progress view
+        is deleted before the next round streams (stale), while its thinking
+        message stays - it is that round's permanent block now."""
+        fd, path = tempfile.mkstemp(suffix=".txt")
+        os.close(fd)
+        with open(path, "w") as f:
+            f.write("DATA")
+        self.addCleanup(os.unlink, path)
+        stream_mock.side_effect = [
+            iter([("reasoning", "checking"),
+                  ("content", "on it "),
+                  ("tool_calls", [{"id": "c1", "name": "read_file",
+                                   "arguments": {"path": path}}])]),
+            iter([("reasoning", "all done"),
+                  ("content", "the answer")]),
+        ]
+        clock = {"t": 1000.0}
+
+        def fake_time():
+            clock["t"] += 10.0
+            return clock["t"]
+
+        g = {"id": 100, "type": "supergroup"}
+        with mock.patch.object(main.time, "time", fake_time):
+            main.handle_message(make_config(stream_drafts=True), self.tg,
+                                msg(text="read it", chat=g), self.state)
+        # only the ANSWER progress message went away - the thinking block of
+        # round 1 survived as a permanent, fully edited block
+        self.assertEqual([mid for _c, mid in self.tg.deleted], [1000 + 2])
+        # groups never stream drafts (the Bot API rejects them there)
+        self.assertEqual(self.tg.drafts, [])
+        edits = [(mid, s) for _c, mid, s in self.tg.edits]
+        self.assertTrue(any(mid == 1000 + 1 and "checking" in s.get("html", "")
+                            for mid, s in edits))
+        # round 2 streamed into fresh messages below the tool lines and its
+        # final delivery only edited them - no new send at all
+        self.assertEqual(len(self.tg.rich), 4)
+        self.assertEqual(edits[-1], (1000 + 4, {"markdown": "the answer"}))
+
+    @mock.patch.object(providers, "chat_stream")
+    def test_stream_with_thinking_off_never_shows_reasoning(self, stream_mock):
+        """/thinking off gates the LIVE stream too: no reasoning message is
+        ever created and the answer takes the single message."""
+        stream_mock.return_value = iter([("reasoning", "secret"),
+                                         ("content", "hello")])
+        self.state.set_thinking(42, False)
+        clock = {"t": 1000.0}
+
+        def fake_time():
+            clock["t"] += 10.0
+            return clock["t"]
+
+        with mock.patch.object(main.time, "time", fake_time):
+            main.handle_message(make_config(stream_drafts=True), self.tg,
+                                msg(text="hi"), self.state)
+        self.assertEqual([s for _c, s, _t in self.tg.rich],
+                         [{"markdown": "hello"}])
+        self.assertNotIn("secret", str(self.tg.rich) + str(self.tg.edits))
 
     @mock.patch.object(providers, "chat")
     @mock.patch.object(providers, "chat_stream", side_effect=providers.ProviderError("nope"))
@@ -768,6 +1098,7 @@ class TestStop(unittest.TestCase):
         self.state = main.State(True)
         self.cfg = make_config(stream_drafts=True)
         self.q = queue.Queue()
+        disable_titles(self)  # titling is its own class (and hits network)
 
     def test_stop_cmd_matching(self):
         self.assertTrue(main._is_stop_cmd(msg(text="/stop")))
@@ -789,6 +1120,87 @@ class TestStop(unittest.TestCase):
         self.assertTrue(consumed)
         self.assertTrue(self.q.empty())
         self.assertTrue(self.state.interrupted((100, None)))
+
+    def test_native_stop_button_interrupts_the_turn(self):
+        """sendRichMessageDraft(can_stop=True) shows Telegram's own Stop
+        button; the press arrives as stopped_message_generation and must
+        interrupt the very same session turn."""
+        self.state.begin_turn((100, None))
+        upd = {"stopped_message_generation":
+               {"chat": {"id": 100, "type": "private"}, "draft_id": 4242}}
+        self.assertTrue(main._route_update(self.state, self.q, upd))
+        self.assertTrue(self.q.empty())          # never queued as a message
+        self.assertTrue(self.state.interrupted((100, None)))
+
+    def test_native_stop_in_topic_targets_that_slot(self):
+        self.state.begin_turn((100, 7))
+        upd = {"stopped_message_generation":
+               {"chat": {"id": 100, "type": "supergroup"},
+                "message_thread_id": 7, "draft_id": 1}}
+        self.assertTrue(main._route_update(self.state, self.q, upd))
+        self.assertTrue(self.state.interrupted((100, 7)))
+        self.assertFalse(self.state.interrupted((100, None)))
+
+    def test_native_stop_with_nothing_running_is_harmless(self):
+        upd = {"stopped_message_generation":
+               {"chat": {"id": 100, "type": "private"}, "draft_id": 5}}
+        self.assertTrue(main._route_update(self.state, self.q, upd))
+        self.assertTrue(self.q.empty())          # not a message, no crash
+        self.assertFalse(self.state.interrupted((100, None)))
+
+    def test_poll_thread_never_dies(self):
+        """THE 'bot stops responding' bug: the poll thread is the only
+        producer of updates. If it raises, the process keeps running (so
+        systemd's Restart=never fires) while the bot goes silent forever.
+        the shape seen in the logs:
+            Exception in thread updates: ... TimeoutError: The read
+            operation timed out
+        A read timeout escaped telegram.call()'s handlers (urlopen only
+        wraps send-phase errors in URLError). Both TelegramError and any
+        unexpected exception must be caught and retried, forever."""
+        calls = {"n": 0}
+
+        class FakeTG:
+            def get_updates(self, offset=None):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise ValueError("malformed update")     # unexpected bug
+                if calls["n"] == 2:
+                    raise main.tg_mod.TelegramError("down")  # known path
+                raise KeyboardInterrupt  # BaseException -> leaves the loop
+
+        with mock.patch.object(main.time, "sleep", lambda s: None):
+            with self.assertRaises(KeyboardInterrupt):
+                main._watch_updates(FakeTG(), self.state, self.q)
+        self.assertEqual(calls["n"], 3)  # kept polling through both failures
+        self.assertTrue(self.q.empty())
+
+    def test_one_bad_update_does_not_wedge_polling(self):
+        """A malformed update must not stop the next one from being routed
+        (and the offset still advances, so it is not re-delivered forever)."""
+        pending = [{"update_id": 1}, {"update_id": 2}]
+        seen_offsets = []
+
+        class FakeTG:
+            def get_updates(self, offset=None):
+                seen_offsets.append(offset)
+                if pending:
+                    return [pending.pop(0)]
+                raise KeyboardInterrupt
+
+        real_route = main._route_update
+
+        def flaky(state, out_q, upd):
+            if upd["update_id"] == 1:
+                raise KeyError("bad update")
+            return real_route(state, out_q, upd)
+
+        with mock.patch.object(main, "_route_update", side_effect=flaky):
+            with mock.patch.object(main.time, "sleep", lambda s: None):
+                with self.assertRaises(KeyboardInterrupt):
+                    main._watch_updates(FakeTG(), self.state, self.q)
+        self.assertEqual(seen_offsets[:2], [None, 2])  # offset advanced past #1
+        self.assertEqual(self.q.qsize(), 1)        # #2 was routed normally
 
     def test_stop_replies_when_idle(self):
         main.handle_message(self.cfg, self.tg, msg(text="/stop"), self.state)
@@ -812,7 +1224,9 @@ class TestStop(unittest.TestCase):
         self.assertIn("partial answer", hist[-1]["content"])
         # user was told; no final full answer was delivered
         self.assertTrue(any("stopped" in t for _c, t, _th in self.tg.sent))
-        self.assertEqual(self.tg.rich, [])
+        # edit-mode placeholder was created while thinking, then dropped on /stop
+        self.assertTrue(self.tg.rich)
+        self.assertTrue(self.tg.deleted)
         # turn bookkeeping cleared
         self.assertNotIn((100, None), state.active_turns)
         self.assertNotIn((100, None), state.interrupts)
@@ -900,6 +1314,44 @@ class TestToolLoop(unittest.TestCase):
         last = chat_mock.call_args_list[-1][0][3]
         self.assertEqual(len([m for m in last if m.get("role") == "tool"]),
                          rounds)
+
+    @mock.patch.object(providers, "chat")
+    def test_text_form_tool_call_recovered(self, chat_mock):
+        """The model sometimes writes the call as TEXT instead
+        of using the tools API and raw markup reached chat. The loop must
+        parse it, run the round, and never show markup (tag built by
+        concatenation - literal closing-parameter strings get cut in transit).
+        """
+        fd, path = tempfile.mkstemp(suffix=".txt")
+        os.close(fd)
+        with open(path, "w") as f:
+            f.write("SECRET-CONTENT-42")
+        self.addCleanup(os.unlink, path)
+        cl = "<" + "/parameter>"
+        markup = ("<tool_call><function=read_file><parameter=path>" + path
+                  + cl + "<" + "/function></tool_call>")
+        chat_mock.side_effect = [
+            ("checking " + markup, "", None),
+            ("the content is SECRET-CONTENT-42", "", None),
+        ]
+        main.handle_message(self.cfg, self.tg, msg(text="read it"), self.state)
+        # recovered call executed: round 2 carries the tool result
+        second = chat_mock.call_args_list[1]
+        tools_seen = [m for m in second[0][3] if m.get("role") == "tool"]
+        self.assertEqual(len(tools_seen), 1)
+        self.assertIn("SECRET-CONTENT-42", tools_seen[0]["content"])
+        # history: proper tool_calls round, markup stripped
+        hist = self.state.get_history(100, None)
+        self.assertEqual([m["role"] for m in hist],
+                         ["user", "assistant", "tool", "assistant"])
+        self.assertEqual(hist[1]["tool_calls"][0]["function"]["name"],
+                         "read_file")
+        self.assertNotIn("<tool_call>", hist[1]["content"])
+        # final answer delivered, no raw markup anywhere in chat
+        self.assertEqual(self.tg.rich[-1][1],
+                         {"markdown": "the content is SECRET-CONTENT-42"})
+        for _c, t, _th in self.tg.sent:
+            self.assertNotIn("<function", t)
 
     @mock.patch.object(providers, "chat")
     def test_tool_round_remembered_next_turn(self, chat_mock):
@@ -1003,7 +1455,7 @@ class TestToolLoop(unittest.TestCase):
         self.assertIn("not executed", hist[3]["content"])
         self.assertIn("interrupted", hist[4]["content"])
 
-    def test_close_tool_rounds_and_trim_hygiene(self):
+    def test_close_tool_rounds_and_orphan_tools(self):
         h = [{"role": "user", "content": "go"},
              {"role": "assistant", "content": "", "tool_calls": [
                  {"id": "a", "type": "function",
@@ -1016,12 +1468,58 @@ class TestToolLoop(unittest.TestCase):
         self.assertEqual(h[3]["tool_call_id"], "b")
         main._close_tool_rounds(h)  # idempotent
         self.assertEqual(len(h), 4)
-        # front-trim orphan: a tool result whose call was summarized away
+        # leading orphan: a tool result whose call was cut away
         h2 = [{"role": "tool", "tool_call_id": "gone", "content": "orphan"},
               {"role": "user", "content": "u"},
               {"role": "assistant", "content": "a"}]
-        main._trim(h2, limit=2)
+        main._strip_orphan_tools(h2)
         self.assertEqual([m["role"] for m in h2], ["user", "assistant"])
+
+    @mock.patch.object(providers, "chat")
+    def test_no_message_cap_whole_history_is_sent(self, chat_mock):
+        """There is no 24-message cap any more: every stored message goes to
+        the model and auto-compact alone bounds the size of the context."""
+        state = self.state
+        hist = state.get_history(100, None)
+        for i in range(40):
+            hist.append({"role": "user" if i % 2 == 0 else "assistant",
+                         "content": "m%d" % i})
+        chat_mock.return_value = ("ok", "", None)
+        main.handle_message(self.cfg, self.tg, msg(text="hi"), state)
+        sent = chat_mock.call_args[0][3]  # messages arg
+        # system prompt + all 40 stored messages + the new user message
+        self.assertEqual(len(sent), 40 + 1 + 1)
+        self.assertEqual(sent[1]["content"], "m0")   # the OLDEST message rides
+        self.assertEqual(sent[-1]["content"], "hi")
+        self.assertEqual(len(hist), 42)              # 40 + user + the answer
+
+    def test_images_stay_in_the_prompt_for_the_newest_only(self):
+        """Without a message cap, base64 images would ride on every call
+        forever - so only the newest IMAGE_KEEP image-bearing messages keep
+        theirs in the prompt, and that is a prompt-side change only: the
+        stored history keeps every picture."""
+        state = self.state
+        hist = state.get_history(100, None)
+        pic = {"type": "image_url",
+               "image_url": {"url": "data:image/jpeg;base64,QUJD"}}
+        for i in range(main.IMAGE_KEEP + 2):
+            hist.append({"role": "user",
+                         "content": [{"type": "text", "text": "pic %d" % i},
+                                     dict(pic)]})
+        sent = main._prompt(hist)
+        self.assertEqual(len(sent), len(hist))        # no message dropped
+        self.assertEqual([sum(1 for p in m["content"]
+                              if isinstance(p, dict) and p.get("type") == "image_url")
+                          for m in sent],
+                         [0, 0] + [1] * main.IMAGE_KEEP)
+        self.assertEqual(sent[0]["content"][0],       # text survives intact
+                         {"type": "text", "text": "pic 0"})
+        self.assertEqual(sent[0]["content"][1]["type"], "text")
+        # the STORED history still has every picture
+        self.assertTrue(all(any(isinstance(p, dict) and p.get("type") == "image_url"
+                                for p in m["content"]) for m in hist))
+        empty = []
+        self.assertIs(main._prompt(empty), empty)     # nothing to drop
 
     @mock.patch.object(providers, "chat")
     def test_mid_turn_message_injected_at_boundary(self, chat_mock):
@@ -1168,7 +1666,7 @@ class TestEditStreaming(unittest.TestCase):
         disable_titles(self)
 
     @mock.patch.object(providers, "chat_stream")
-    def test_group_stream_uses_edits_not_drafts(self, stream_mock):
+    def test_group_stream_uses_edits(self, stream_mock):
         stream_mock.return_value = iter([("reasoning", "hmm about that"),
                                          ("content", "hello **world**")])
         tg = FakeTG()
@@ -1176,11 +1674,10 @@ class TestEditStreaming(unittest.TestCase):
         g = {"id": 100, "type": "supergroup"}
         main.handle_message(make_config(stream_drafts=True), tg,
                             msg(text="hi", chat=g), state)
-        self.assertEqual(tg.drafts, [])       # drafts are private-only
         self.assertTrue(tg.rich)              # placeholder message created
         self.assertTrue(tg.edits)             # live edits happened
-        # final delivery: thinking details edited into the placeholder,
-        # full answer markdown delivered
+        # final delivery: full thinking edited into its message, the answer
+        # message already carries the full markdown (single-chunk stream)
         self.assertEqual(tg.rich[-1][1], {"markdown": "hello **world**"})
         edited_ids = [mid for _c, mid, _s in tg.edits]
         self.assertIn(1000 + 1, edited_ids)   # first message was edited
@@ -1302,7 +1799,8 @@ class TestUsageAccounting(unittest.TestCase):
 
 
 class TestContextCostCommands(unittest.TestCase):
-    """P3: /context and /cost (group 21)."""
+    """P3: /context and /cost (group 21) - ONE shared report (both names show
+    the same thing, cost included) plus the user/replies/tools history split."""
 
     def setUp(self):
         self.tg = FakeTG()
@@ -1312,7 +1810,7 @@ class TestContextCostCommands(unittest.TestCase):
 
     @mock.patch.object(providers, "price_for")
     @mock.patch.object(providers, "chat", return_value=("a", "", None))
-    def test_context_shows_usage_without_cost(self, _, price_mock):
+    def test_context_shows_full_report_including_cost(self, _, price_mock):
         price_mock.return_value = {"context": 1048576}
         main.handle_message(self.cfg, self.tg, msg(text="hello"), self.state)
         self.tg.sent.clear()
@@ -1323,23 +1821,62 @@ class TestContextCostCommands(unittest.TestCase):
         self.assertIn("<b>context</b>", text)
         # used/max against the model's REAL window (models.dev, tokens)
         self.assertIn("/ 1,048,576 tokens", text)
-        self.assertIn("chars", text)
+        self.assertNotIn("chars", text)     # tokens only, no char counts
+        self.assertIn("messages", text)     # message count kept
         self.assertIn("<b>tokens</b>", text)
         self.assertIn("auto-compact:", text)
-        self.assertNotIn("<b>cost</b>", text)
+        self.assertNotIn("<b>history</b>", text)  # split line dropped
+        self.assertIn("<b>cost</b>: $", text)   # same report as /cost
         self.assertRegex(text, r"\d{8}-\d{4}-[0-9a-f]{4}")
 
     @mock.patch.object(providers, "price_for",
                        return_value={"context": 500000})
-    def test_cost_adds_cost_line_and_context_block(self, _):
+    def test_context_and_cost_are_the_same_report(self, _):
+        """/context and /cost run through one handler: identical output."""
+        main.handle_message(self.cfg, self.tg, msg(text="/context"), self.state)
+        by_context = self.tg.sent[-1][1]
         main.handle_message(self.cfg, self.tg, msg(text="/cost"), self.state)
+        by_cost = self.tg.sent[-1][1]
+        self.assertEqual(by_context, by_cost)
+        self.assertIn("<b>cost</b>: $", by_cost)   # cost is never hidden now
+        self.assertIn("/ 500,000 tokens", by_cost)  # model window, not config
+        self.assertIn("<b>model</b>", by_cost)
+        self.assertIn("triggers at", by_cost)  # threshold lives on its own line
+
+    def test_report_counts_tool_use_in_tokens_and_messages(self):
+        """Tool rounds ARE context: a call's name + JSON arguments (which
+        live on the assistant message, never in its content) and its result
+        are all counted - in the token estimate and in the message count."""
+        args = '{"command":"ls"}'
+        self.state.get_history(100, None).extend([
+            {"role": "user", "content": "run it"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "type": "function",
+                 "function": {"name": "bash", "arguments": args}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "RESULT-OUTPUT"},
+            {"role": "assistant", "content": "done"},
+        ])
+        history = self.state.history[(100, None)]
+        # the rule: [A-Za-z0-9] ~4 chars/token, every other character 1 token
+        self.assertEqual(main._est_tokens("abcd"), 1)
+        self.assertEqual(main._est_tokens("abcde"), 2)
+        self.assertEqual(main._est_tokens("a b"), 2)    # spaces cost 1 each
+        self.assertEqual(main._est_tokens("日本語"), 3)  # CJK: 1 token each
+        # user + assistant(tool_calls) + tool result + assistant answer
+        self.assertEqual(main._history_tokens(history),
+                         main._est_tokens("run it") + main._est_tokens("bash")
+                         + main._est_tokens(args)
+                         + main._est_tokens("RESULT-OUTPUT")
+                         + main._est_tokens("done"))
+        self.assertEqual(main._history_tokens(history), 19)
+        # with cfg the system prompt rides along (it is sent on every call)
+        self.assertEqual(main._history_tokens(history, self.cfg),
+                         19 + main._est_tokens(self.cfg.system_prompt))
+        main.handle_message(self.cfg, self.tg, msg(text="/context"), self.state)
         text = self.tg.sent[-1][1]
-        self.assertIn("<b>cost</b>: $", text)
-        self.assertIn("<b>tokens</b>", text)
-        self.assertIn("<b>context</b>", text)
-        self.assertIn("/ 500,000 tokens", text)  # model window, not config
-        self.assertIn("<b>model</b>", text)
-        self.assertIn("triggers at", text)  # threshold lives on its own line
+        self.assertNotIn("<b>history</b>", text)   # the split line is gone
+        self.assertIn("4 messages", text)          # user + agent + tool msgs
+        self.assertNotIn("chars", text)            # tokens only
 
     @mock.patch.object(providers, "price_for", return_value=None)
     def test_context_max_unknown_without_metadata(self, _):
@@ -1825,9 +2362,10 @@ class TestSessionTitles(unittest.TestCase):
 
     @mock.patch.object(providers, "price_for", return_value=None)
     @mock.patch.object(providers, "chat")
-    def test_model_title_applied_once_after_reply(self, chat_mock, price_mock):
-        """No interim rename: nothing is applied while the reply is being
-        generated; the successful model title is the session's one rename."""
+    def test_model_title_applied_before_the_reply(self, chat_mock, price_mock):
+        """THE RENAME COMES FIRST: the model title is the session's name
+        while the reply is still being generated - and it stays the one and
+        only rename."""
         first = "Fix the checkout total rounding bug"
         seen = {}
 
@@ -1839,35 +2377,46 @@ class TestSessionTitles(unittest.TestCase):
 
         chat_mock.side_effect = fake
         main.handle_message(self.cfg, self.tg, msg(text=first), self.state)
-        self.assertIsNone(seen["name"])                # no rename before reply
+        self.assertEqual(seen["name"], "Model Title")  # renamed BEFORE reply
         meta = self.state.meta[(100, None)]
         self.assertEqual(meta["name"], "Model Title")  # exactly one rename
         self.assertEqual(meta["name_src"], "llm")
+        # ...and the title call physically preceded the reply call
+        first_call = chat_mock.call_args_list[0][0][3]
+        self.assertTrue(self._is_naming(first_call))
 
-    @mock.patch.object(providers, "price_for", return_value=None)
     @mock.patch.object(providers, "chat")
-    def test_naming_runs_concurrently_with_the_reply(self, chat_mock,
-                                                     price_mock):
-        """The naming thread must be inside its call while the reply is
-        still being generated (not after it)."""
-        naming_entered = threading.Event()
-        saw = {}
+    def test_rename_is_done_before_the_message_reaches_the_api(self, chat_mock):
+        """Ordering contract: the session title runs (and is applied) before
+        the message is handed to the model - not after the reply returns."""
+        order = []
+        chat_mock.side_effect = lambda *a, **k: order.append("api") or ("a", "", None)
+        with mock.patch.object(main, "_maybe_name_session",
+                               lambda *a, **k: order.append("title-start")
+                               or {"handle": 1}), \
+             mock.patch.object(main, "_finish_naming",
+                               lambda *a, **k: order.append("renamed")):
+            main.handle_message(self.cfg, self.tg, msg(text="name me"),
+                                self.state)
+        self.assertEqual(order, ["title-start", "renamed", "api"])
 
-        def fake(name, api_key, model, messages, **kw):
-            if self._is_naming(messages):
-                naming_entered.set()
-                return ("Concurrent Title", "", None)
-            naming_entered.wait(5)
-            saw["during"] = naming_entered.is_set()
-            return ("answer", "", None)
-
-        chat_mock.side_effect = fake
-        main.handle_message(self.cfg, self.tg, msg(text="first message"),
-                            self.state)
-        self.assertTrue(saw.get("during"),
-                        "naming did not start during the reply")
-        self.assertEqual(self.state.meta[(100, None)]["name"],
-                         "Concurrent Title")
+    def test_slow_title_still_renames_before_the_reply(self):
+        """Past TITLE_WAIT the model title is abandoned and the derived one
+        is applied instead - still BEFORE the reply starts, never after."""
+        handle = {"usage": {}, "provider": "go", "model": "m",
+                  "result": [None], "raw": "plan a trip to Da Lat",
+                  "images": None}
+        hang = threading.Event()
+        t = threading.Thread(target=lambda: hang.wait(5), daemon=True)
+        handle["thread"] = t
+        t.start()
+        main._finish_naming(self.cfg, self.tg, self.state, 100, None, handle,
+                            timeout=0.01)
+        meta = self.state.meta[(100, None)]
+        self.assertTrue(meta.get("name"))            # a name exists...
+        self.assertEqual(meta["name_src"], "derived")  # ...the fallback one
+        self.assertNotIn("_naming", meta)            # attempt is spent
+        hang.set()
 
     @mock.patch.object(providers, "price_for", return_value=None)
     @mock.patch.object(providers, "chat")

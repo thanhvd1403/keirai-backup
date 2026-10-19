@@ -1,4 +1,4 @@
-"""Tests for the Parallel Search MCP client (offline, HTTP mocked)."""
+"""Tests for the Exa MCP client (offline, HTTP mocked)."""
 import unittest
 from unittest import mock
 
@@ -84,37 +84,84 @@ class TestCallTool(unittest.TestCase):
 
 
 class TestToolArgs(unittest.TestCase):
+    """web_search -> one web_search_exa call per query; web_fetch ->
+    one batched web_fetch_exa call. Both go to the Exa endpoint, with the
+    API key on the URL when one is configured."""
+
     def setUp(self):
-        self.cfg = config_mod.Config({"parallel_api_key": "pk"})
+        self.cfg = config_mod.Config({"exa_api_key": "pk"})
 
     @mock.patch.object(websearch, "call_tool", return_value="results")
-    def test_search_args(self, call_mock):
+    def test_search_one_call_per_query(self, call_mock):
         out = websearch.search(self.cfg, "find zebras",
-                               ["zebra facts", "zebra news"],
-                               session_id="keirai-100-main" * 20)
-        self.assertEqual(out, "results")
+                               ["zebra facts", "zebra news"])
+        self.assertEqual(out, "### zebra facts\nresults\n\n"
+                              "### zebra news\nresults")
+        self.assertEqual(call_mock.call_count, 2)  # Exa takes ONE query
         name, args = call_mock.call_args[0][0], call_mock.call_args[0][1]
-        self.assertEqual(name, "web_search")
+        self.assertEqual(name, "web_search_exa")
         self.assertEqual(args["objective"], "find zebras")
-        self.assertEqual(args["search_queries"], ["zebra facts", "zebra news"])
-        self.assertLessEqual(len(args["session_id"]), 100)
-        self.assertEqual(call_mock.call_args[1]["api_key"], "pk")
+        self.assertEqual(args["query"], "zebra news")   # last call
+        self.assertEqual(args["numResults"], websearch.RESULTS_PER_QUERY)
+        self.assertIn("exaApiKey=pk", call_mock.call_args[1]["url"])
+
+    @mock.patch.object(websearch, "call_tool", return_value="results")
+    def test_search_caps_queries(self, call_mock):
+        websearch.search(self.cfg, "obj", ["a", "b", "c", "d", "e"])
+        self.assertEqual(call_mock.call_count, websearch.MAX_QUERIES)
+
+    @mock.patch.object(websearch, "call_tool")
+    def test_search_keeps_partial_results(self, call_mock):
+        call_mock.side_effect = [websearch.MCPError("boom"), "one result"]
+        out = websearch.search(self.cfg, "obj", ["q1", "q2"])
+        self.assertEqual(out, "### q2\none result")   # the failure is dropped
+
+    @mock.patch.object(websearch, "call_tool",
+                       side_effect=websearch.MCPError("rate limited"))
+    def test_search_raises_when_everything_fails(self, call_mock):
+        with self.assertRaises(websearch.MCPError):
+            websearch.search(self.cfg, "obj", ["q1", "q2"])
 
     @mock.patch.object(websearch, "call_tool", return_value="md")
     def test_fetch_args(self, call_mock):
         websearch.fetch(self.cfg, ["https://a.example", "https://b.example"],
-                        objective="the price", full_content=True)
-        args = call_mock.call_args[0][1]
-        self.assertEqual(args["urls"], ["https://a.example", "https://b.example"])
-        self.assertEqual(args["objective"], "the price")
-        self.assertTrue(args["full_content"])
+                        full_content=True)
+        name, args = call_mock.call_args[0][0], call_mock.call_args[0][1]
+        self.assertEqual(name, "web_fetch_exa")
+        self.assertEqual(args["urls"], ["https://a.example",
+                                        "https://b.example"])
+        self.assertEqual(args["maxCharacters"], websearch.FULL_CHARS)
+        self.assertIn("exaApiKey=pk", call_mock.call_args[1]["url"])
 
     @mock.patch.object(websearch, "call_tool", return_value="md")
-    def test_fetch_defaults_omit_optionals(self, call_mock):
+    def test_fetch_defaults_to_excerpts(self, call_mock):
         websearch.fetch(self.cfg, ["https://a.example"])
         args = call_mock.call_args[0][1]
-        self.assertNotIn("objective", args)
-        self.assertNotIn("full_content", args)
+        self.assertEqual(args["maxCharacters"], websearch.EXCERPT_CHARS)
+
+
+class TestEndpoint(unittest.TestCase):
+    def test_key_goes_on_the_url(self):
+        cfg = config_mod.Config({"exa_api_key": "s3cret key"})
+        self.assertEqual(websearch.endpoint(cfg),
+                         websearch.MCP_URL + "?exaApiKey=s3cret%20key")
+
+    def test_no_key_plain_endpoint(self):
+        self.assertEqual(websearch.endpoint(config_mod.Config({})),
+                         websearch.MCP_URL)
+
+
+class TestQuotaGuard(unittest.TestCase):
+    def test_rate_limit_text_raises(self):
+        # Exa hands back a throttled search as ordinary content - it must
+        # never reach the model as if it were search results
+        with self.assertRaises(websearch.MCPError) as cm:
+            websearch._check_quota("You've hit Exa's free MCP rate limit. "
+                                   "Create your own API key.")
+        self.assertIn("rate limit", str(cm.exception))
+
+    def test_normal_results_pass(self):
+        websearch._check_quota("# Title\nURL: https://example.com\nbody")
 
 
 if __name__ == "__main__":

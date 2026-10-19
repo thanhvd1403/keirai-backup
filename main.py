@@ -22,13 +22,17 @@ import md2tg
 import providers
 import sessions
 import telegram as tg_mod
+import textcalls
 import tools as tools_mod
 
 log = logging.getLogger("keirai")
 
-HISTORY_LIMIT = 24  # messages per chat kept in memory
-CHARS_PER_TOKEN = 4  # rough chars->token ratio for context estimates
+CHARS_PER_TOKEN = 4  # ordinary ASCII text: this many chars per token
+IMAGE_KEEP = 4  # newest image-bearing messages whose pictures are re-sent
+COMPACT_FALLBACK_KEEP = 6  # floor of the last-resort trim (see chat_with_history)
 SESSION_ID = "keirai"  # anonymized x-opencode-session for the whole app (no chat ids)
+TITLE_WAIT = 10  # seconds the rename may take before the reply starts (derived
+                 # title past that - the rename itself always happens first)
 SLOT_NONE = object()  # sid_slot(): not found (None means the main-chat slot)
 TEXT_EXTS = {
     ".txt", ".md", ".py", ".js", ".ts", ".json", ".yaml", ".yml", ".toml",
@@ -906,7 +910,7 @@ def cmd_compact(cfg, tg, msg, thread_id, state):
         _err(tg, msg, thread_id, "no API key for provider '%s'" % provider)
         return
     tg.typing(chat_id, thread_id)
-    before_n, before_chars = len(history), _est_chars(history)
+    before_n, before_tok = len(history), _history_tokens(history, cfg)
     cusage = {}
     try:
         history[:] = _compact(cfg, provider, api_key, model_id, history,
@@ -919,22 +923,20 @@ def cmd_compact(cfg, tg, msg, thread_id, state):
     state.persist(chat_id, thread_id)
     log.info("manual compact: chat=%s thread=%s %d->%d msgs", chat_id, thread_id,
              before_n, len(history))
-    tg.send(chat_id, "compacted: %d -> %d messages (%d -> %d chars)"
-            % (before_n, len(history), before_chars, _est_chars(history)), thread_id)
+    fmt = lambda n: "{:,}".format(int(n))  # noqa: E731 - tiny local helper
+    tg.send(chat_id, "compacted: %d -> %d messages (~%s -> ~%s tokens)"
+            % (before_n, len(history), fmt(before_tok),
+               fmt(_history_tokens(history, cfg))), thread_id)
 
 
-@command("context", "context window usage of this session (name/id/model, tokens)")
+@command("context", "context window usage of this session (name/id/model, tokens, cost)")
+@command("cost", "same report as /context: tokens in/out/cached + total cost")
 def cmd_context(cfg, tg, msg, thread_id, state):
+    """ONE handler behind BOTH names: /context and /cost describe the same
+    session state, so they render the same report (they used to differ - only
+    /cost showed the money - which made both feel incomplete)."""
     chat_id = msg["chat"]["id"]
-    tg.send(chat_id, _session_report(cfg, state, chat_id, thread_id, False),
-            thread_id)
-
-
-@command("cost", "cost of this session: tokens in/out/cached + total")
-def cmd_cost(cfg, tg, msg, thread_id, state):
-    chat_id = msg["chat"]["id"]
-    tg.send(chat_id, _session_report(cfg, state, chat_id, thread_id, True),
-            thread_id)
+    tg.send(chat_id, _session_report(cfg, state, chat_id, thread_id), thread_id)
 
 
 def _model_context(cfg, model_full):
@@ -954,52 +956,54 @@ def _model_context(cfg, model_full):
         return None
 
 
-def _compact_limit_chars(cfg, model_full):
-    """Auto-compact threshold in chars.
+def _compact_limit_tokens(cfg, model_full):
+    """Auto-compact threshold in tokens.
 
-    Default: 100% of the model's context window (models.dev tokens x the
-    rough chars-per-token ratio). An explicit context_limit_chars in
-    config.toml overrides it; without metadata we fall back to that value."""
+    Default: 100% of the model's context window (models.dev). An explicit
+    context_limit_tokens in config.toml overrides it; without metadata we
+    fall back to that value."""
     if cfg.context_limit_explicit:
-        return cfg.context_limit_chars
+        return cfg.context_limit_tokens
     ctx = _model_context(cfg, model_full)
     if ctx:
-        return ctx * CHARS_PER_TOKEN
-    return cfg.context_limit_chars
+        return ctx
+    return cfg.context_limit_tokens
 
 
-def _session_report(cfg, state, chat_id, thread_id, with_cost):
-    """Shared body of /context and /cost (group 21).
+def _session_report(cfg, state, chat_id, thread_id):
+    """The single body behind /context and /cost (they are aliases).
 
     The context line is the model's real window (models.dev, used/max in
-    tokens); the auto-compact threshold appears only on its own line."""
+    tokens); `used` is the rough estimate of what the next call re-reads -
+    system prompt, user text, agent replies and tool use included - and the
+    message count covers every stored message (user messages, agent
+    responses and tool calls/results alike). Tokens only: no character
+    counts and no per-role split - tool use is counted, just not itemised.
+    The auto-compact threshold appears only on its own line."""
     key = state.chat_key(chat_id, thread_id)
     history = state.history.get(key) or []
-    chars = _est_chars(history)
     meta = state.ensure_meta(chat_id, thread_id)
     model = state.model_for(chat_id, thread_id, cfg.default_model)
     name = state.topic_names.get(key) or meta.get("name") or "session"
     fmt = lambda n: "{:,}".format(int(n))  # noqa: E731 - tiny local helper
     ctx_max = _model_context(cfg, model)
-    used_tok = chars // CHARS_PER_TOKEN
+    used_tok = _history_tokens(history, cfg)
     if ctx_max:
         pct = min(100, int(round(used_tok * 100.0 / ctx_max)))
-        context_line = ("<b>context</b>: ~%s / %s tokens (~%d%%) · %s chars · "
-                        "%d messages"
-                        % (fmt(used_tok), fmt(ctx_max), pct, fmt(chars),
-                           len(history)))
+        context_line = ("<b>context</b>: ~%s / %s tokens (~%d%%) · %d messages"
+                        % (fmt(used_tok), fmt(ctx_max), pct, len(history)))
     else:
         context_line = ("<b>context</b>: ~%s tokens (max unknown - models.dev "
-                        "cache empty) · %s chars · %d messages"
-                        % (fmt(used_tok), fmt(chars), len(history)))
-    limit = _compact_limit_chars(cfg, model)
-    would_compact = chars > limit and len(history) > 6
+                        "cache empty) · %d messages"
+                        % (fmt(used_tok), len(history)))
+    limit = _compact_limit_tokens(cfg, model)
+    would_compact = used_tok > limit and len(history) > 6
     if cfg.context_limit_explicit:
-        at = "%s chars (context_limit_chars)" % fmt(limit)
+        at = "%s tokens (context_limit_tokens)" % fmt(limit)
     elif ctx_max:
         at = "100%% of the model window (%s tokens)" % fmt(ctx_max)
     else:
-        at = "%s chars (models.dev cache empty - config fallback)" % fmt(limit)
+        at = "%s tokens (models.dev cache empty - config fallback)" % fmt(limit)
     lines = [
         "<b>session</b>: %s · <code>%s</code>"
         % (_esc(str(name)), _esc(str(meta.get("session_id") or "?"))),
@@ -1012,9 +1016,8 @@ def _session_report(cfg, state, chat_id, thread_id, with_cost):
         % tuple("{:,}".format(int(meta.get(k) or 0)) for k in
                 ("tokens_in", "tokens_out", "tokens_cached_read",
                  "tokens_cached_write")),
+        "<b>cost</b>: $%.6f" % (meta.get("cost_usd") or 0.0),
     ]
-    if with_cost:
-        lines.append("<b>cost</b>: $%.6f" % (meta.get("cost_usd") or 0.0))
     return "\n".join(lines)
 
 
@@ -1249,14 +1252,15 @@ def _naming_content(cfg, raw, images):
 
 
 def _maybe_name_session(cfg, tg, state, chat_id, thread_id, msg, images):
-    """Group 19, called at turn START (before the reply is generated).
+    """Group 19, called at turn START - BEFORE the reply is generated.
 
-    The MODEL title is generated first - concurrently with the reply - in a
-    daemon thread that performs only the HTTP call; _finish_naming applies
-    it on the main thread, so a successful run renames exactly once. The
-    derived title is only the fallback when the model call times out or
-    returns faulty output - and it sticks: one attempt per session, no
-    retries (a retry would just rename twice). Returns the handle, or None.
+    The MODEL title call runs in a daemon thread that performs only the
+    HTTP request; ai_reply joins it immediately (_finish_naming), so the
+    rename lands before the message ever reaches the model. A successful
+    run renames exactly once. The derived title is the fallback when the
+    model call exceeds TITLE_WAIT or returns faulty output - and it sticks:
+    one attempt per session, no retries (a retry would just rename twice).
+    Returns the handle, or None.
     """
     meta = state.ensure_meta(chat_id, thread_id)
     if meta.get("name"):
@@ -1291,13 +1295,15 @@ def _maybe_name_session(cfg, tg, state, chat_id, thread_id, msg, images):
     return handle
 
 
-def _finish_naming(cfg, tg, state, chat_id, thread_id, handle, timeout=5):
-    """Join the naming thread (bounded) and apply its result on the main
-    thread. Success = exactly one rename (the model title). On timeout or
-    faulty output the derived title is the fallback - the session's single
-    attempt is spent, so the visible name never churns. Abandoning a live
-    thread is race-free: it only writes its own dict, and _naming is always
-    cleared here (the finally runs even on error/interrupt paths)."""
+def _finish_naming(cfg, tg, state, chat_id, thread_id, handle,
+                   timeout=TITLE_WAIT):
+    """Join the naming thread (bounded) and apply its result, BEFORE the
+    reply starts. Success = exactly one rename (the model title). Past
+    `timeout` - or on faulty output - the derived title is the fallback:
+    the session's single attempt is spent, so the visible name never
+    churns, but it always exists before the model is called. Abandoning a
+    live thread is race-free: it only writes its own dict, and _naming is
+    always cleared here."""
     thread = handle.get("thread")
     reason = None
     if thread is not None:
@@ -1326,16 +1332,46 @@ def _finish_naming(cfg, tg, state, chat_id, thread_id, handle, timeout=5):
     return True
 
 
-def _est_chars(history):
+def _est_tokens(text):
+    """Rough token count of a string - no tokenizer dependency.
+
+    [A-Za-z0-9] runs at the usual ~4 chars/token; every other character
+    (spaces, punctuation, newlines, CJK, emoji, control chars) counts as
+    1 token each, which is roughly what byte-level BPE charges for it.
+    Deliberately errs high: auto-compact then fires early, never late.
+    The message framing (role keys, JSON envelope) is not counted."""
+    alnum = sum(1 for ch in text if ch.isascii() and ch.isalnum())
+    return (alnum + CHARS_PER_TOKEN - 1) // CHARS_PER_TOKEN + (len(text) - alnum)
+
+
+def _msg_tokens(m):
+    """Tokens a single history message contributes to the prompt."""
     n = 0
-    for m in history:
-        c = m.get("content")
-        if isinstance(c, str):
-            n += len(c)
-        elif isinstance(c, list):
-            for part in c:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    n += len(part.get("text", ""))
+    c = m.get("content")
+    if isinstance(c, str):
+        n += _est_tokens(c)
+    elif isinstance(c, list):
+        for part in c:
+            if isinstance(part, dict) and part.get("type") == "text":
+                n += _est_tokens(part.get("text", ""))
+    for call in m.get("tool_calls") or []:  # ride on the assistant message
+        f = call.get("function") or {}
+        n += _est_tokens(str(f.get("name") or ""))
+        n += _est_tokens(str(f.get("arguments") or ""))
+    return n
+
+
+def _history_tokens(history, cfg=None):
+    """Everything the model re-reads from this history, in rough tokens.
+
+    Tool use is context too and used to be invisible: a call's name + JSON
+    arguments ride on the assistant message (never in `content`) and the
+    result is its own role:"tool" message - both are sent to the model, so
+    both are counted here. With cfg, the system prompt is counted as well:
+    it rides on every call."""
+    n = sum(_msg_tokens(m) for m in history)
+    if cfg is not None and cfg.system_prompt:
+        n += _est_tokens(cfg.system_prompt)
     return n
 
 
@@ -1347,14 +1383,25 @@ def _compact(cfg, provider, api_key, model_id, history, session_id, keep=4,
     older = history[:-keep] if len(history) > keep else []
     if not older:
         return history
-    transcript = []
-    for m in older:
+    # The summary request is built from a text transcript (never raw
+    # messages), but a session with no message cap could still make that
+    # transcript too big for the window - keep the newest older messages
+    # first, up to ~1/8 of the window (chars, worst-case estimator = 1/2).
+    ctx = _model_context(cfg, "%s/%s" % (provider, model_id)) or cfg.context_limit_tokens
+    budget = max(8_000, ctx * CHARS_PER_TOKEN // 8)
+    transcript, size = [], 0
+    for m in reversed(older):
         role = m.get("role", "?")
         c = m.get("content")
         if isinstance(c, list):
             c = " ".join(p.get("text", "") for p in c if isinstance(p, dict)
                          and p.get("type") == "text")
-        transcript.append("%s: %s" % (role, (c or "")[:4000]))
+        line = "%s: %s" % (role, (c or "")[:4000])
+        if transcript and size + len(line) > budget:
+            break
+        transcript.append(line)
+        size += len(line)
+    transcript.reverse()
     prompt = ("Summarize this earlier conversation concisely in markdown "
               "(facts, decisions, open tasks, user preferences), under 400 words:\n\n"
               + "\n".join(transcript))
@@ -1395,39 +1442,150 @@ def _strip_orphan_tools(history):
         history.pop(0)
 
 
-def _trim(history, limit=None):
-    """Keep the newest messages, then drop orphaned leading tool results."""
-    del history[:-(limit or HISTORY_LIMIT)]
-    _strip_orphan_tools(history)
+def _prompt(history):
+    """History as handed to the API: ALL of it - there is no message cap any
+    more, auto-compact alone bounds size (send the whole session, summarize
+    when it gets big). One exception: base64 images. Re-sending every picture
+    ever received would push each request past provider image/size caps and
+    re-bill image tokens on every call, so only the newest IMAGE_KEEP
+    image-bearing messages keep theirs; older pictures become a marker in the
+    PROMPT only - stored history is untouched. Returns `history` itself when
+    there is nothing to drop (the common case)."""
+    marker = ("[image omitted - only the newest %d stay in context]"
+              % IMAGE_KEEP)
+    keep, out = IMAGE_KEEP, None
+    for i in range(len(history) - 1, -1, -1):
+        parts = history[i].get("content")
+        if not isinstance(parts, list) or not any(
+                isinstance(p, dict) and p.get("type") == "image_url"
+                for p in parts):
+            continue
+        if keep:
+            keep -= 1
+            continue
+        if out is None:
+            out = list(history)  # shallow: stored messages keep their images
+        fresh, marked = [], False
+        for p in parts:
+            if isinstance(p, dict) and p.get("type") == "image_url":
+                if not marked:
+                    fresh.append({"type": "text", "text": marker})
+                    marked = True
+                continue
+            fresh.append(p
+            )
+        msg = dict(history[i])
+        msg["content"] = fresh
+        out[i] = msg
+    return history if out is None else out
+
+
+def _thinking_html(text):
+    return ("<details><summary>\U0001f914 Thinking</summary>%s</details>"
+            % text)
+
+
+def _live_new(show, draft, draft_id=0):
+    """Live progress state for one turn:
+      msg_id    the thinking block - ONE message per round, edited in place
+                from the first reasoning delta until the round ends
+      answer_id the streamed answer's own message (edit mode), right below
+                the thinking so the thinking stays readable
+      role      slot -> "thinking" | "answer": what that message holds, so
+                the final delivery can never overwrite one with the other
+      draft     the answer streams through sendRichMessageDraft instead
+                (no answer message exists until the final send)
+    """
+    return {"msg_id": None, "answer_id": None, "role": dict(),
+            "thinking": bool(show), "on": True, "draft": bool(draft),
+            "draft_id": draft_id}
+
+
+def _edit_or_send(tg, live, slot, chat_id, thread_id, role=None, **src):
+    """Edit a live slot's message in place, sending it on the first flush.
+    `role` is recorded when the message is created (see _live_new)."""
+    if live.get(slot):
+        tg.edit_rich(chat_id, live[slot], **src)
+    else:
+        live[slot] = tg.send_rich(chat_id, thread_id=thread_id, **src)["message_id"]
+        if role:
+            live.setdefault("role", {})[slot] = role
+
+
+def _drop_live(tg, live, chat_id, keep_thinking=False):
+    """Forget the round's live messages and clean up the progress views.
+
+    keep_thinking: the round's thinking block was just made permanent (it is
+    the SAME message the thinking streamed into), so only the slot is
+    cleared and the message stays - the next round streams into fresh
+    messages BELOW the tool lines. Interrupts pass keep_thinking=False:
+    every partial progress view goes away."""
+    if not live:
+        return
+    roles = live.setdefault("role", {})
+    for slot in ("msg_id", "answer_id"):
+        mid = live.pop(slot, None)
+        role = roles.pop(slot, None)
+        if not mid:
+            continue
+        if keep_thinking and role == "thinking":
+            continue  # permanent block - stays in the chat
+        try:
+            tg.delete_message(chat_id, mid)
+        except Exception:
+            pass
+
+
+def _stream_draft(tg, live, chat_id, thread_id, answer):
+    """Modern streaming API: sendRichMessageDraft (Bot API 10.1) streams the
+    answer as an animated preview in the chat - real-time, no message to
+    churn. Re-sending the same draft_id animates it; Telegram's own Stop
+    button (can_stop) arrives as a stopped_message_generation update. The
+    preview is ephemeral (~30s), so the final answer is sent for real by
+    _send_rich_answer. Any error -> back to in-place edits."""
+    try:
+        tg.send_rich_draft(chat_id, live["draft_id"], markdown=answer,
+                           thread_id=thread_id, can_stop=True)
+    except tg_mod.TelegramError as e:
+        log.warning("draft stream failed (%s) - falling back to edits", e)
+        live["draft"] = False
 
 
 def _flush_live(tg, live, chat_id, thread_id, reasoning, answer, show_reasoning):
-    """Push current partial state to Telegram: drafts in private chats,
-    send/edit of a placeholder message elsewhere (live edits)."""
-    if show_reasoning and reasoning:
-        if live["mode"] == "draft":
-            tg.send_rich_draft(
-                chat_id, live["draft_id"],
-                html="<tg-thinking>%s</tg-thinking>" % _esc(reasoning[-2000:]),
-                thread_id=thread_id)
+    """Push current partial state to Telegram.
+
+    Thinking: exactly ONE block per round - created on the first reasoning
+    delta (before any content) and edited in place for the rest of the turn,
+    including reasoning that arrives between answer chunks (interleaved
+    thinking), so the block never duplicates or freezes half-finished.
+
+    Answer: draft in private chats (sendRichMessageDraft), otherwise the
+    answer's own message edited in place below the thinking (nothing to
+    think about -> the answer takes the first slot)."""
+    roles = live.setdefault("role", {})
+    if reasoning and live.get("thinking") and (
+            roles.get("msg_id") == "thinking"
+            or (show_reasoning and not live.get("msg_id"))):
+        try:
+            _edit_or_send(tg, live, "msg_id", chat_id, thread_id, role="thinking",
+                          html=_thinking_html(_esc(reasoning[-2000:])))
+        except tg_mod.TelegramError as e:
+            if not tg_mod.is_not_modified(e):
+                raise  # real failure -> _stream_answer disables live updates
+            # unchanged content = the block already shows this exact text
+    if answer and answer.strip() and len(answer) <= md2tg.RICH_LIMIT:
+        if live.get("draft"):
+            _stream_draft(tg, live, chat_id, thread_id, answer)
         else:
-            # tg-thinking is draft-only -> collapsible <details> placeholder
-            src = ("<details><summary>\U0001f914 Thinking</summary>%s</details>"
-                   % _esc(reasoning[-2000:]))
-            if live.get("msg_id"):
-                tg.edit_rich(chat_id, live["msg_id"], html=src)
-            else:
-                live["msg_id"] = tg.send_rich(chat_id, html=src,
-                                              thread_id=thread_id)["message_id"]
-    elif answer and len(answer) <= md2tg.RICH_LIMIT:
-        if live["mode"] == "draft":
-            tg.send_rich_draft(chat_id, live["draft_id"], markdown=answer,
-                               thread_id=thread_id)
-        elif live.get("msg_id"):
-            tg.edit_rich(chat_id, live["msg_id"], markdown=answer)
-        else:
-            live["msg_id"] = tg.send_rich(chat_id, markdown=answer,
-                                          thread_id=thread_id)["message_id"]
+            slot = "answer_id" if live.get("msg_id") else "msg_id"
+            try:
+                _edit_or_send(tg, live, slot, chat_id, thread_id, role="answer",
+                              markdown=answer)
+            except tg_mod.TelegramError as e:
+                if not tg_mod.is_not_modified(e):
+                    raise
+                # same reasoning as above: a no-op is not a failure, and it
+                # must not stop the thinking slot from flushing either
 
 
 def _stream_answer(tg, msg, live, stop, provider, api_key, model_id, messages,
@@ -1444,10 +1602,13 @@ def _stream_answer(tg, msg, live, stop, provider, api_key, model_id, messages,
                                              usage_out=usage_out):
         if kind == "tool_calls":
             return answer, reasoning, delta
-        if kind == "reasoning" and show_reasoning:
+        if kind == "reasoning":
+            # reasoning ALWAYS accumulates as reasoning: a model that keeps
+            # thinking between answer chunks must not leak thought text into
+            # the answer (that used to look like a second thinking block)
             reasoning += delta
         else:
-            show_reasoning = False
+            show_reasoning = False  # first content token ends the thinking
             answer += delta
         if stop and stop():
             log.info("stream cut short by /stop")
@@ -1459,6 +1620,8 @@ def _stream_answer(tg, msg, live, stop, provider, api_key, model_id, messages,
                 _flush_live(tg, live, chat_id, thread_id, reasoning, answer,
                             show_reasoning)
             except tg_mod.TelegramError as e:
+                if tg_mod.is_not_modified(e):
+                    continue  # same content as last flush - not a failure
                 log.warning("live updates disabled: %s", e)
                 live["on"] = False
     return answer, reasoning, None
@@ -1481,20 +1644,50 @@ def _injected_user_msg(upd):
                        "into account and continue]\n" + text}
 
 
-def _send_thinking_block(tg, chat_id, thread_id, reasoning_md, cfg):
+def _send_thinking_block(tg, chat_id, thread_id, reasoning_md, cfg, live=None):
     """Persist ONE round's reasoning as its own collapsible block. Every
     completed round gets one, so the user can watch the model think round by
     round (and steer mid-turn) instead of seeing only the last block after
-    the turn ends. Cosmetic: never lets a send failure break the turn."""
+    the turn ends.
+
+    When the thinking streamed live, the SAME message is edited into its
+    final form - never a second block next to the half-streamed one. Only
+    chunks past RICH_LIMIT (or no live block at all) need extra messages.
+    Cosmetic: never lets a send failure break the turn."""
+    roles = (live or {}).get("role") or {}
+    live_mid = ((live or {}).get("msg_id")
+                if roles.get("msg_id") == "thinking" else None)
+    chunks = [c for c in md2tg.split(reasoning_md, md2tg.RICH_LIMIT)
+              if c.strip()]
+    if not chunks:  # nothing worth showing (caller usually guards already)
+        return
     sent = False
     if cfg.rich_messages:
         try:
-            for chunk in md2tg.split(reasoning_md, md2tg.RICH_LIMIT):
-                tg.send_rich(chat_id,
-                             html="<details><summary>\U0001f914 Thinking</summary>%s"
-                                  "</details>" % chunk,
-                             thread_id=thread_id)
-            sent = True
+            if live_mid:
+                tg.edit_rich(chat_id, live_mid,
+                             html=_thinking_html(chunks[0]))
+                # the streamed message IS the block now - release the slot
+                live["msg_id"] = None
+                roles.pop("msg_id", None)
+                for chunk in chunks[1:]:
+                    tg.send_rich(chat_id, html=_thinking_html(chunk),
+                                 thread_id=thread_id)
+                sent = True
+            else:
+                for chunk in chunks:
+                    tg.send_rich(chat_id, html=_thinking_html(chunk),
+                                 thread_id=thread_id)
+                sent = True
+        except tg_mod.TelegramError as e:
+            if tg_mod.is_not_modified(e) and live_mid:
+                # the streamed text already matches the final block - the
+                # no-op edit IS the finished block, nothing to fall back to
+                live["msg_id"] = None
+                roles.pop("msg_id", None)
+                sent = True
+            else:
+                log.warning("rich thinking block failed (%s) - falling back", e)
         except Exception as e:
             log.warning("rich thinking block failed (%s) - falling back", e)
     if not sent:
@@ -1509,17 +1702,19 @@ def _send_thinking_block(tg, chat_id, thread_id, reasoning_md, cfg):
 def ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
     chat_id = msg["chat"]["id"]
     key = state.chat_key(chat_id, thread_id)
-    # titling starts WITH the user's message: stage 1 lands inline, stage 2
-    # generates concurrently with the reply (applied in the finally below)
-    naming = _maybe_name_session(cfg, tg, state, chat_id, thread_id, msg,
-                                 images)
     state.begin_turn(key)
     try:
+        # THE RENAME COMES FIRST: the session is titled (model title with a
+        # bounded wait, derived title as the fallback) BEFORE the message is
+        # handed to the model, so the reply is generated under the name the
+        # chat already shows - not renamed afterwards.
+        naming = _maybe_name_session(cfg, tg, state, chat_id, thread_id, msg,
+                                     images)
+        if naming is not None:
+            _finish_naming(cfg, tg, state, chat_id, thread_id, naming)
         _ai_reply(cfg, tg, msg, thread_id, state, text, images)
     finally:
         state.end_turn(key)
-        if naming is not None:
-            _finish_naming(cfg, tg, state, chat_id, thread_id, naming)
 
 
 def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
@@ -1572,8 +1767,8 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
     history.append(user_msg)
 
     # auto-compact at the threshold (default: 100% of the model's window)
-    if not stop() and _est_chars(history) > _compact_limit_chars(cfg, model_full) \
-            and len(history) > 6:
+    if not stop() and len(history) > 6 and _history_tokens(history, cfg) \
+            > _compact_limit_tokens(cfg, model_full):
         before = len(history)
         cusage = {}
         try:
@@ -1585,26 +1780,48 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
             log.info("auto-compact: chat=%s thread=%s %d -> %d msgs",
                      chat_id, thread_id, before, len(history))
         except Exception as e:
-            log.warning("auto-compact failed (%s) - trimming oldest instead", e)
-            _trim(history, 6)
+            log.warning("auto-compact failed (%s)", e)
+            ctx = _model_context(cfg, model_full)
+            if ctx and _history_tokens(history, cfg) > ctx:
+                # Summarizing failed AND the window is really full: such a
+                # session could never be sent again. Drop the oldest until it
+                # fits with room to spare. Last resort only - normal operation
+                # has no message cap at all (auto-compact bounds size).
+                half = ctx // 2
+                while len(history) > COMPACT_FALLBACK_KEEP and \
+                        _history_tokens(history, cfg) > half:
+                    del history[:max(1, len(history) // 2)]
+                _strip_orphan_tools(history)
+                log.warning("session trimmed to its newest %d messages (no "
+                            "room in the %d-token window)", len(history), ctx)
 
     _close_tool_rounds(history)  # safety net: no dangling tool_calls ever
-    messages = ([{"role": "system", "content": cfg.system_prompt}] if cfg.system_prompt else []) + history[-HISTORY_LIMIT:]
+    # the WHOLE session goes to the model - no message cap (auto-compact bounds size)
+    messages = ([{"role": "system", "content": cfg.system_prompt}]
+                if cfg.system_prompt else []) + _prompt(history)
     tool_specs = tools_mod.available_specs(cfg)
-    # session_id stays the anonymized app-wide constant (provider header +
-    # MCP args); spill_session is this session's own id -> spill files land
-    # in sessions/<session-id>/tool_output/
+    # session_id stays the anonymized app-wide constant (provider header);
+    # spill_session is this session's own id -> spill files land in
+    # sessions/<session-id>/tool_output/
     ctx = {"session_id": session_id, "interrupt": stop,
            "spill_session": state.ensure_meta(chat_id, thread_id).get("session_id")}
+    show = state.thinking_on(msg["from"]["id"])  # stable: /thinking queues
     live = None
     if cfg.rich_messages and cfg.stream_drafts:
-        live = {"mode": "draft" if msg["chat"].get("type") == "private" else "edit",
-                "draft_id": secrets.randbelow(10**9) + 1, "msg_id": None, "on": True}
+        # Live streaming: the thinking block is streamed edit-in-place; the
+        # answer streams as a sendRichMessageDraft preview in private chats
+        # (stream_mode = "draft") or through edits of a message of its own
+        # below it (groups, or stream_mode = "edit"). Drafts never touch the
+        # user's composer, so they keep typing and sending mid-turn (folded
+        # in at the next tool boundary) and between turns.
+        draft_ok = (cfg.stream_mode == "draft"
+                    and (msg.get("chat") or {}).get("type") == "private")
+        live = _live_new(show, draft_ok,
+                         draft_id=secrets.randbelow(2 ** 31 - 1) + 1)
 
     reasoning, answer = None, None
     interrupted = False
     rounds = 0
-    show = state.thinking_on(msg["from"]["id"])  # stable: /thinking queues
     while True:  # unbounded: runs until the model stops calling tools
         # fold in messages that arrived mid-turn: they were sent after the
         # previous tool use finished, so the model sees them right now and
@@ -1646,13 +1863,29 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
             interrupted = True
             break
         if not tcs:
-            break  # the model produced its final text
+            # the model sometimes writes the call as TEXT instead of using
+            # the tools API - recover it and run the round; raw markup must
+            # never reach the chat
+            tcs, answer = textcalls.recover(answer)
+            if not tcs:
+                break  # the model produced its final text
+            log.warning("recovered text-form tool call(s) - model bypassed "
+                        "the tools API: chat=%s thread=%s", chat_id, thread_id)
         rounds += 1
         log.info("tool round %d: %d call(s)", rounds, len(tcs))
         # this round's reasoning becomes a permanent block BEFORE the tools
-        # run - every block is shown as it happens, not just the last one
+        # run - every block is shown as it happens, not just the last one.
+        # It edits the block the thinking streamed into (one message per
+        # round - never a second, half-streamed one next to it)
         if show and (reasoning or "").strip():
-            _send_thinking_block(tg, chat_id, thread_id, reasoning, cfg)
+            _send_thinking_block(tg, chat_id, thread_id, reasoning, cfg,
+                                 live=live)
+        # the round's live view is now superseded (the thinking block above
+        # is permanent, tool lines appear below it): release it so the NEXT
+        # round streams into fresh messages underneath instead of editing
+        # messages that sit above the tool lines. The thinking message is
+        # kept; only the answer's progress view is cleaned up.
+        _drop_live(tg, live, chat_id, keep_thinking=True)
         # run the tools the model asked for - the round (input + results) is
         # recorded in history too, so the next turn remembers what happened
         # instead of re-reading the same file over and over
@@ -1720,7 +1953,7 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
              chat_id, thread_id, rounds, len(answer or ""))
 
     history.append({"role": "assistant", "content": answer})
-    _trim(history)
+    _strip_orphan_tools(history)
     state.persist(chat_id, thread_id)
 
     reasoning_md = reasoning if (show and reasoning and reasoning.strip()) else None
@@ -1744,13 +1977,9 @@ def _deliver_interrupted(tg, state, msg, thread_id, partial, live):
     _close_tool_rounds(history)  # keep the partial round; close its calls
     body = (((partial or "").strip() + "\n\n") if (partial or "").strip() else "")
     history.append({"role": "assistant", "content": body + INTERRUPT_NOTE})
-    _trim(history)
+    _strip_orphan_tools(history)
     state.persist(chat_id, thread_id)
-    if live and live.get("msg_id"):  # drop the half-finished live message
-        try:
-            tg.delete_message(chat_id, live["msg_id"])
-        except Exception:
-            pass
+    _drop_live(tg, live, chat_id)  # drop the half-finished live message(s)
     log.info("turn interrupted by user: chat=%s thread=%s", chat_id, thread_id)
     try:
         tg.send(chat_id, "\u23f9 stopped - the running reply/tool was interrupted.",
@@ -1761,28 +1990,60 @@ def _deliver_interrupted(tg, state, msg, thread_id, partial, live):
 
 def _send_rich_answer(tg, chat_id, thread_id, answer_md, thinking_md, live=None):
     """Bot API 10.1 rich messages: thinking as a collapsible <details> first,
-    then the answer as GFM markdown chunks (32k each). When a live edit-mode
-    placeholder exists, the first chunk edits it in instead of sending new."""
+    then the answer as GFM markdown chunks (32k each). The live slots edit in
+    place instead of sending: the streamed thinking block keeps ITS message,
+    and so does the streamed answer (edit mode) - a fully streamed turn only
+    needs the drafts' final send. Slots are matched by ROLE, so thinking can
+    never overwrite the answer's message (or vice versa); a live message
+    nothing lands in is deleted rather than left behind as a stale progress
+    view."""
     items = []  # (kind, src), kind: "html" | "markdown"
     if thinking_md:
         for chunk in md2tg.split(thinking_md, md2tg.RICH_LIMIT):
-            items.append(("html",
-                          "<details><summary>\U0001f914 Thinking</summary>%s</details>"
-                          % chunk))
+            if chunk.strip():
+                items.append(("html", _thinking_html(chunk)))
     for chunk in md2tg.split_rich(answer_md):
-        items.append(("markdown", chunk))
-    if live and live.get("msg_id"):
-        kind, src = items[0]
-        try:
-            if kind == "html":
-                tg.edit_rich(chat_id, live["msg_id"], html=src)
-            else:
-                tg.edit_rich(chat_id, live["msg_id"], markdown=src)
-            items = items[1:]
+        if chunk.strip():  # never send an empty rich message (400)
+            items.append(("markdown", chunk))
+    slots = []
+    if live:
+        roles = live.get("role") or {}
+        if live.get("msg_id") and thinking_md \
+                and roles.get("msg_id") == "thinking":
+            slots.append(("msg_id", "html"))  # the block that streamed
+        if live.get("answer_id"):
+            slots.append(("answer_id", "markdown"))
+        elif live.get("msg_id") and not thinking_md \
+                and roles.get("msg_id") == "answer":
+            slots.append(("msg_id", "markdown"))  # the answer streamed here
+        # ...and when the answer holds the ONLY message while thinking_md is
+        # due, the slot is left over on purpose: it is deleted below and both
+        # are sent fresh, so the thinking still lands above the answer.
+    for slot, kind in slots:
+        mid = live.get(slot)
+        hit = next((i for i, (k, _s) in enumerate(items) if k == kind), None)
+        if not mid or hit is None:
+            continue
+        live[slot] = None  # consumed (cleared before the edit so a failed
+        try:               # edit cannot leave the slot looking stale)
+            k, src = items[hit]
+            tg.edit_rich(chat_id, mid, **{k: src})
+            items.pop(hit)
         except tg_mod.TelegramError as e:
+            if tg_mod.is_not_modified(e):
+                items.pop(hit)  # identical content - the edit is a no-op
+                continue        # success, not a failure
             log.warning("final live edit failed, sending fresh: %s", e)
             try:
-                tg.delete_message(chat_id, live["msg_id"])
+                tg.delete_message(chat_id, mid)
+            except Exception:
+                pass
+    for slot in ("msg_id", "answer_id"):  # leftovers: stale progress views
+        mid = live.get(slot) if live else None
+        if mid:
+            live[slot] = None
+            try:
+                tg.delete_message(chat_id, mid)
             except Exception:
                 pass
     for kind, src in items:
@@ -2087,7 +2348,21 @@ def _is_stop_cmd(msg):
 
 def _route_update(state, out_q, upd):
     """Watcher decision: consume /stop for a running turn, else queue.
-    Returns True when the update was consumed (not queued)."""
+    Returns True when the update was consumed (not queued).
+
+    Two ways to stop a turn: the /stop command, and Telegram's own Stop
+    button under a streamed draft (sendRichMessageDraft can_stop=True) -
+    the latter arrives as stopped_message_generation and interrupts the
+    very same turn."""
+    native = upd.get("stopped_message_generation")
+    if native:
+        chat = native.get("chat") or {}
+        key = state.chat_key(chat.get("id"), native.get("message_thread_id"))
+        hit = state.request_interrupt(key)
+        log.info("native stop %s: chat=%s thread=%s draft=%s",
+                 "requested" if hit else "ignored (nothing running)",
+                 key[0], key[1], native.get("draft_id"))
+        return True  # not a message: never queue it
     msg = upd.get("message")
     if msg and _is_stop_cmd(msg):
         if state.request_interrupt(_msg_key(msg)):
@@ -2099,7 +2374,12 @@ def _route_update(state, out_q, upd):
 
 
 def _watch_updates(tg, state, out_q):
-    """Long-poll getUpdates forever. Sole owner of the offset."""
+    """Long-poll getUpdates forever. Sole owner of the offset.
+
+    This thread dying = the bot goes silent forever (everything else runs
+    off its queue), so it never raises: the Telegram call maps transport
+    errors to TelegramError, and anything else a malformed update or an
+    unexpected bug could throw is caught, logged and retried here."""
     offset = None
     backoff = 1
     while True:
@@ -2111,9 +2391,17 @@ def _watch_updates(tg, state, out_q):
             time.sleep(backoff)
             backoff = min(backoff * 2, 60)
             continue
+        except Exception:
+            log.exception("unexpected poll failure - retrying in %ds", backoff)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+            continue
         for upd in updates:
-            offset = upd["update_id"] + 1
-            _route_update(state, out_q, upd)
+            try:
+                offset = upd["update_id"] + 1  # advance even if routing fails
+                _route_update(state, out_q, upd)
+            except Exception:
+                log.exception("failed to route update - skipping it")
 
 
 def _dispatch_update(cfg, tg, state, workers, upd):
@@ -2240,7 +2528,13 @@ def main():
                      daemon=True, name="updates").start()
     workers = {}  # session key -> queue; a worker thread per active session
     while True:
-        _dispatch_update(cfg, tg, state, workers, out_q.get())
+        # the dispatcher must survive a bad update: exiting here would take
+        # the whole bot down (systemd restarts it, but in-flight state is
+        # lost), so log and keep pumping the queue
+        try:
+            _dispatch_update(cfg, tg, state, workers, out_q.get())
+        except Exception:
+            log.exception("dispatcher error - continuing")
 
 
 # ---------------------------------------------------------------- helpers

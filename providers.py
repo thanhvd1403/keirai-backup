@@ -50,8 +50,15 @@ def _request(url, api_key, payload=None, timeout=30, session_id=None):
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", "replace")
         raise ProviderError("HTTP %d from %s: %s" % (e.code, url, body[:300]))
-    except urllib.error.URLError as e:
-        raise ProviderError("%s: %s" % (url, e.reason))
+    except (urllib.error.URLError, OSError) as e:
+        # URLError = connect/send failures; raw OSError = timeouts/resets
+        # WHILE reading the body (urllib does not wrap those). Everything
+        # the caller handles must arrive as ProviderError, or the Go->Zen
+        # fallback never fires and the turn dies with a raw exception.
+        reason = getattr(e, "reason", None) or e
+        raise ProviderError("%s: %s" % (url, reason))
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        raise ProviderError("%s: bad response (%s)" % (url, e))
 
 
 def _get_json(url, timeout=60):

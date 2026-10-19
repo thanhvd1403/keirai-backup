@@ -99,8 +99,6 @@ def available_specs(cfg):
             "given a URL to read.",
             {"urls": {"type": "array", "items": {"type": "string"},
                       "description": "1-20 HTTP(S) URLs"},
-             "objective": {"type": "string",
-                           "description": "Optional: what to look for (focused excerpts)"},
              "full_content": {"type": "boolean",
                               "description": "Return full page markdown (can be huge); "
                                              "default false = excerpts"}},
@@ -302,8 +300,7 @@ def _web_search(cfg, args, ctx):
     queries = args.get("search_queries") or []
     if not objective or not isinstance(queries, list) or not queries:
         raise ToolError("objective and search_queries are required")
-    return websearch.search(cfg, objective, [str(q) for q in queries],
-                            session_id=ctx.get("session_id"))
+    return websearch.search(cfg, objective, [str(q) for q in queries])
 
 
 def _web_fetch(cfg, args, ctx):
@@ -311,9 +308,7 @@ def _web_fetch(cfg, args, ctx):
     if not isinstance(urls, list) or not urls:
         raise ToolError("urls is required")
     return websearch.fetch(cfg, [str(u) for u in urls],
-                           objective=args.get("objective") or None,
-                           full_content=bool(args.get("full_content")),
-                           session_id=ctx.get("session_id"))
+                           full_content=bool(args.get("full_content")))
 
 
 # ---------------------------------------------------------------- browser

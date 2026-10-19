@@ -67,15 +67,20 @@
   - `rich_messages` config kill-switch (default on); automatic fallback to regular messages on TelegramError
 - [x] Thinking display as native collapsible `<details><summary>` block (rich HTML path, converted via our md2tg)
 - [x] `/test_rich` command + regular-message fallback kept for old paths (`/test_md`)
-- [x] Streaming drafts: `sendRichMessageDraft` (private chats) while generating
-  - Verified live (2026-09-25): drafts work with `message_thread_id` inside private-chat topics, incl. `draft_id` reuse for animation -> streaming keeps working in topics, no fallback needed
-  - Reasoning shown live as `<tg-thinking>` placeholder, then answer markdown streamed (first flush immediate, then every 1.5s)
-  - Final `sendRichMessage` persists the message (draft is ephemeral, ~30s)
-  - `stream_drafts` config toggle; automatic fallback to blocking call on any error
+- [x] Streaming: the thinking block is streamed by **editing ONE message in place**, the answer through Telegram's modern streaming API
+  - Thinking: created on the first reasoning delta (before any content) and edited in place until the round ends - reasoning arriving between answer chunks keeps editing the SAME block; a tool round edits that block into its final form instead of sending a second one, then releases the slot (`_drop_live(keep_thinking=True)`) so the next round streams below the tool lines
+  - Answer: `sendRichMessageDraft` (Bot API 10.1) in private chats - animated preview in the chat, ephemeral ~30s, `can_stop` -> the user's native Stop button -> `stopped_message_generation` -> the same interrupt as `/stop`; the finished answer is then persisted with `sendRichMessage`. Groups (drafts are private-only) and `stream_mode = "edit"` fall back to in-place edits of a message of its own below the thinking
+  - NOTE: `sendRichMessageDraft` is NOT `sendMessageDraft` (9.3) - the latter lands in the USER's composer and blocks them from typing/sending (bugs.telegram.org/c/62189)
+  - First flush immediate, then every 1.5s; `stream_drafts` is the streaming master switch, `stream_mode = "draft"|"edit"` picks the mechanism; automatic fallback to a blocking call on any error, draft errors fall back to edits
+  - Final delivery matches the live messages by ROLE (thinking/answer), so one can never overwrite the other's message; leftovers are deleted, not left stale
+- [x] Streaming bugs fixed
+  - `Telegram.delete_message` called the API method `delete_message` -> HTTP 404 on every call, so every cleanup silently did nothing and half-streamed messages piled up in the chat; now `deleteMessage`
+  - reasoning deltas that arrived after the first content token were appended to the ANSWER -> thinking text leaked into the answer and read like a second thinking block; reasoning now always accumulates as reasoning
+  - the tool round sent a SECOND thinking block next to the half-streamed live one; it now edits the streamed message (one block per round)
 - [x] `==marked==`, footnotes, `$$formulas$$`, inline HTML - work automatically via GFM markdown passthrough
 - [x] Media blocks in answers: `![alt](url)` passes through natively on the rich path; the regular path degrades it to a link (Telegram HTML has no `<img>`)
 - [x] `editMessageText(rich_message=...)` for live edits after send
-  - Non-private chats stream via send placeholder + rich edits (drafts are private-only); first chunk of the final answer edits the placeholder in
+  - Non-private chats (and `stream_mode = "edit"`) stream via send placeholder + rich edits; the final answer edits the streamed answer's message in place
   - Any edit failure deletes the placeholder and sends fresh
 
 ## P1 - Session Management & Context Control (complete)
@@ -97,10 +102,13 @@
 - [x] Do NOT delete the Telegram topic - send a confirmation that the session is deleted and note the user can delete the topic manually
 
 ### 11. Context window management
-- [x] Configurable limit for context size: `context_limit_chars` (chars; default 120000 ~ 30k tokens - no tokenizer dependency)
+- [x] Configurable limit for context size: `context_limit_tokens` (rough tokens; default 30000 - no tokenizer dependency; was `context_limit_chars`, renamed when the report went tokens-only)
 - [x] `/compact` slash command: manually compact the current session's context (reports before/after sizes)
-- [x] Auto-compact when context exceeds the configured limit (falls back to trimming oldest on failure)
+- [x] Auto-compact when context exceeds the configured limit (last resort only: if summarizing fails AND the window is full, drop oldest down to ~half the window, floor 6 messages)
 - [x] Compaction strategy: summarize older messages via the provider into a `[Summary of earlier conversation]` marker message, keep the last 4 messages
+- [x] **No message cap**: the whole session history is sent every call (`_prompt()`) - auto-compact alone bounds size; was: newest 24 only (`HISTORY_LIMIT` + `_trim`, both removed)
+- [x] Images without a message cap: only the newest `IMAGE_KEEP` (4) image-bearing messages keep their base64 pictures in the prompt (older ones become a marker, stored history untouched) - otherwise every call re-sends every picture ever received: provider image/size caps plus image tokens billed each turn
+- [x] Compaction hardened so it can be the sole bound: the summary transcript is capped at ~1/8 of the model window (newest older messages first) so the summary request itself can never overflow
 
 ### 12. CLI fallback for session management
 - [x] `python cli.py list|delete|rename` - works without Telegram, operates directly on sessions.db
@@ -128,12 +136,12 @@
   - Output too long -> saved whole to `sessions/<session-id>/tool_output/` (over `tool_output_max_bytes`, 40 KB), model gets preview + path (group 27)
   - Interruptible: polls the /stop flag and kills the process mid-run
 
-### 15. Web search & fetch (Parallel API)
-- [x] `web_search` via Parallel Search MCP (free, anonymous - no API key needed)
-- [x] `web_fetch` via the same MCP (excerpts or `full_content`; handles JS pages and PDFs)
-- [x] API key via config: optional `parallel_api_key` / `PARALLEL_API_KEY` only raises rate limits
-- [x] License/pricing checked: Search MCP is free at https://search.parallel.ai/mcp
-  (paid API from $1/1k requests, free monthly allowance); commercial service - no license issue (REST calls only)
+### 15. Web search & fetch (Exa MCP)
+- [x] `web_search` via the hosted **Exa MCP** (https://mcp.exa.ai/mcp) - `web_search_exa`, ONE call per query (the tool's 2-3 diverse queries -> 2-3 calls, capped at `MAX_QUERIES`), results concatenated per query; queries that fail are dropped, only "all failed" raises
+- [x] `web_fetch` via `web_fetch_exa` (all URLs in ONE batched call -> clean markdown); `full_content` raises `maxCharacters` (`FULL_CHARS`), otherwise `EXCERPT_CHARS`. Exa has no per-fetch objective, so that argument left the tool spec
+- [x] API key via config: optional `exa_api_key` / `EXA_API_KEY`, appended as `?exaApiKey=` (the exact form the server hands back); works anonymously too, rate limited
+- [x] Quota guard: Exa reports a throttled search as ordinary content (not `isError`) - `websearch._check_quota` raises instead of feeding a rate-limit notice to the model as if it were results
+- [x] Replaces the **Parallel Search MCP** (`parallel_api_key`/`PARALLEL_API_KEY` removed): the free endpoint started answering HTTP 429 for this server, and Exa's fetch already worked keyless
 - [x] Stdlib streamable-HTTP MCP client (`websearch.py`): initialize -> notifications/initialized -> tools/call, JSON or SSE bodies
 
 ### 16. Browser (Lightpanda)
@@ -174,7 +182,7 @@
 3. [x] **models.dev daily sync** (group 25): one `api.json` fetch/24h -> extract `opencode` + `opencode-go` -> compact `cache/models_meta.json`; `/models` stats display now merges from it (the dead `/models` normalization stays as fallback)
 4. [x] **Go-first priority** (group 25): built-in `default_model` -> `go/mimo-v2.6-flash`; `_alternate_provider()` + `pcall()` in `_ai_reply` - on `ProviderError` retry once via the other provider iff it has a key AND its catalog serves the model id
 5. [x] sessions.db: new **`session_meta` table** (separate from `sessions` so the history REPLACE can't wipe it): `session_id` (`yyyymmdd-hhmm-4hex`, assigned at creation, **backfilled** for pre-existing rows), `name`, **`cost_usd`, `tokens_in`, `tokens_out`, `tokens_cached_read`, `tokens_cached_write`** (cleared together with the session by `/delete`/`/reset-all`)
-6. [x] **`/context`** command (group 21): chars vs limit, message count, auto-compact trigger + session name/id/model + token totals
+6. [x] **`/context`** command (group 21): rough tokens vs limit, message count, auto-compact trigger + session name/id/model + token totals
 7. [x] **`/cost`** command (group 21): the context block + notional cost (cached-read discount applied) + token totals
 8. [x] Tests for each (24 new: usage capture both paths, metadata parse/cache, cost math, fallback routing, command output, meta lifecycle/backfill) + docs (`config.example.toml`, AGENTS.md)
 
@@ -192,7 +200,8 @@
   - Replaces current behavior: `_resolve_provider` routes by model prefix only; key-missing falls back to the other provider (prefer go); built-in default was `zen/glm-5.3-flash` -> with both keys present the default landed on **zen**
 
 ### 21. /context and /cost commands
-- [x] `/context` shows the current context window usage of the session: chars used vs `context_limit_chars`, message count, whether an auto-compact would trigger - plus **session name, session id, active model**
+- [x] `/context` shows the current context window usage of the session: rough tokens used vs `context_limit_tokens`, message count (user + agent + tool messages), whether an auto-compact would trigger - plus **session name, session id, active model**
+- [x] Report is **tokens-only**: no character counts and no `user · replies · tools` split (tool calls/results still counted, just not itemised); estimator = `[A-Za-z0-9]` ~4 chars/token + 1 token per other character, system prompt included; the same estimate drives the auto-compact trigger
 - [x] `/cost` (new): same context block (used vs limit + the auto-compact trigger point) **+ total cost of this session**, plus session name, session id, active model
   - Cost research - **live-probed 2026-09-25** (service-account key; zen blocking + streaming, go, V2 inference): **no cost field anywhere** - not in the JSON body, not in response headers -> **sum locally**: capture `usage` after every API call, multiply by price
     - Blocking: standard `usage` object (returned today, currently discarded); Go additionally reports `prompt_tokens_details.cached_tokens` + `completion_tokens_details.reasoning_tokens`, zen's `prompt_tokens_details` comes back empty on cache misses
@@ -220,13 +229,13 @@
 3. [x] **Topic-flow mode** (group 22): `topic_flow` flag write-through in config.toml; `/topic` enter (typed confirm, BOTH `getMe` preconditions with hints, no auto-created topic, hint `/new`) & exit (typed confirm, persist flag)
 4. [x] **Delivery rules** (group 20): All = commands only (+ hint every plain message), unbound-topic rejection hint, flow-off = topics fully inert + hint every message; rejected/allowed command lists in All
 5. [x] **Bindings & switching** (group 22): topic<->session binding table, switching matrix (normal / unbound / bound x All / in-topic), per-topic prompts, ping liveness + dead-topic recovery, `/stop` topic-only
-6. [x] **Titles** (group 19): extra naming completion after the first user message (default model, runs after the reply, media-aware via models.dev vision info); `/new` in All/topic creates topic + first-message title
+6. [x] **Titles** (group 19): extra naming completion after the first user message (default model, joined BEFORE the reply starts, media-aware via models.dev vision info); `/new` in All/topic creates topic + first-message title
 7. [x] **Mirror commands**: `/rename` renames session AND topic; `/model global <id>` surgical config.toml write (keep comments)
 8. [x] Rewrite the group-9 per-topic isolation tests around flow on/off (213 tests green: mode gates, hints, prompt matrix, ping recovery, titles, config writes) - **unit-tested; live walkthrough with you still pending** (drafts-in-topics + getMe flags already proven live)
 
 ### 19. Agent-generated session titles
 - [x] New sessions get an agent-generated **short** title (replaces "Session N"; `/new <name>` skips generation)
-  - **Single rename**: the call starts with the first user message and runs *concurrently with the reply* in a daemon thread; applied on the main thread after delivery - success = renamed exactly once (model, config default - new sessions start there)
+  - **Single rename, and it comes FIRST**: the naming call runs with the first user message and is joined **before the message reaches the model** (`ai_reply` -> `_maybe_name_session` + `_finish_naming`, bounded by `TITLE_WAIT` = 10s) - the reply is generated under the name the chat already shows; success = renamed exactly once (model, config default - new sessions start there)
   - **JSON-constrained** (`response_format: json_schema`, `max_tokens` 512), OpenCode-style prompt with good/vague/too-long examples
   - **Guards reject, never truncate** (oh-my-pi #7306): tool-call text, >12-word answer-shaped output, prompt-example echoes; no length cap on valid titles
   - **Fallback**: on timeout/fault the derived title (first line, word-boundary ~48 chars; media placeholder) is applied and sticks - **one attempt per session, no retries**

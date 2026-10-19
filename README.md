@@ -14,9 +14,9 @@ pages.
 - **Telegram Bot API** via raw HTTPS (no framework)
 - **Sessions** persisted in SQLite — context survives restarts
 - **Agent tools**: files, shell (blacklist + timeout), web search/fetch, optional Lightpanda browser
-- **Streaming** answers with thinking, rich messages (tables, task lists), markdown fallback
+- **Streaming**: thinking streamed by editing one message in place, the answer through Telegram's streaming API (`sendRichMessageDraft`, native Stop button), rich messages (tables, task lists), markdown fallback
 - **Topic flow**: one Telegram topic = one isolated session
-- **Context management**: auto-compaction at 100% of the model's real context window, manual `/compact`
+- **Context management**: whole history sent, no message cap (newest 4 pictures only) - auto-compaction at 100% of the model's real context window, manual `/compact`
 - **Usage accounting**: tokens and notional cost per session (`/cost`)
 - **Go-first inference** with automatic fallback to Zen on provider errors
 
@@ -54,6 +54,8 @@ Config highlights (`config.toml`, comments allowed — see
 | `tools_enabled` | master switch for the agent's tools |
 | `topic_flow` | sessions live in Telegram topics (or toggle with `/topic`) |
 | `rich_messages` / `stream_drafts` | rich rendering / live streaming, both auto-fall back |
+| `stream_mode` | `"draft"` (default): the answer streams as a `sendRichMessageDraft` preview in private chats; `"edit"`: in-place edits everywhere |
+| `exa_api_key` | optional, raises the free-tier limit of the Exa MCP web tools (env: `EXA_API_KEY`) |
 
 API keys go in `[providers.zen]` / `[providers.go]` (env overrides:
 `KEIRAI_ZEN_API_KEY`, `KEIRAI_GO_API_KEY`).
@@ -76,8 +78,8 @@ Talk to the bot; it replies with your session's history. Main commands
 | `/rename <name>` | rename the current session/topic |
 | `/delete` | delete this session's context |
 | `/model provider/id` | switch model (`/models` to browse with context/cost stats) |
-| `/context` | context window usage: used/max tokens, threshold, session info |
-| `/cost` | tokens in/out/cached + notional cost of this session |
+| `/context` | context window usage: used/max tokens + message count, threshold, tokens + cost |
+| `/cost` | alias of `/context` - the same report |
 | `/compact` | summarize older context now (also runs automatically) |
 | `/stop` | interrupt the reply/tool currently running |
 | `/thinking on\|off` | show/hide AI reasoning |
@@ -141,7 +143,7 @@ md2tg.py       markdown -> Telegram HTML, message splitting
 providers.py   OpenCode Zen/Go clients (blocking + streaming), pricing
 sessions.py    SQLite store (history, models, topics, usage)
 tools.py       LLM tool registry: files, shell, dispatch
-websearch.py   Parallel Search MCP client (free web_search/web_fetch)
+websearch.py   Exa MCP client (web_search_exa / web_fetch_exa)
 browser.py     Lightpanda wrapper (optional browse tool)
 cli.py         session management CLI
 tests/         unit tests (unittest, stdlib)
