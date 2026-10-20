@@ -3,6 +3,8 @@ import os
 import shlex
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -12,6 +14,24 @@ import tools
 # interpreter for the shell tests: `python` is not on every PATH (only
 # python3), which fails these with exit 127 before they test anything
 PY = shlex.quote(sys.executable)
+
+
+def find_process(marker):
+    """cmdline of a live /proc entry containing marker, or None.
+
+    Used to catch processes that outlive the tool call that spawned them -
+    a leak here is exactly what deadlocked a session."""
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open("/proc/%s/cmdline" % pid, "rb") as fh:
+                cmd = fh.read().decode(errors="replace")
+        except OSError:
+            continue
+        if marker and marker in cmd:
+            return cmd
+    return None
 
 
 def make_config(**kw):
@@ -145,6 +165,32 @@ class TestBash(unittest.TestCase):
             "timeout_seconds": 60},
             ctx={"interrupt": stop})
         self.assertIn("INTERRUPTED by the user", out)
+
+    def test_backgrounded_process_does_not_deadlock(self):
+        """A `&` child inherits stdout, so the pipe never reaches EOF. Killing
+        only the shell left communicate() waiting for an EOF that could never
+        come. The tool must return, and the whole process group must die.
+        """
+        marker = "987321"   # unusual number, so a plain /proc scan finds leaks
+        result = {}
+
+        def run():
+            result["out"] = tools.execute(self.cfg, "bash", {
+                "command": "( sleep %s ) & sleep 60" % marker,
+                "timeout_seconds": 1})
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(20)     # a regression hangs forever; keep the suite green
+        self.assertFalse(worker.is_alive(),
+                         "bash tool blocked after the shell was killed")
+        self.assertIn("TIMED OUT", result["out"])
+        for _ in range(30):  # reparenting/reaping can lag the kill briefly
+            if not find_process(marker):
+                break
+            time.sleep(0.1)
+        self.assertIsNone(find_process(marker),
+                          "backgrounded process outlived the tool call")
 
     def test_long_output_spilled_to_session_dir(self):
         """Output over tool_output_max_bytes is saved whole under

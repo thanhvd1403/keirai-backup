@@ -12,6 +12,7 @@ Handlers never raise: errors come back as strings so the tool loop continues.
 import hashlib
 import os
 import re
+import signal
 import subprocess
 import time
 
@@ -252,6 +253,44 @@ def _deny(cmd):
     return None
 
 
+def _kill_and_drain(proc):
+    """Kill the command's whole process group and collect output without ever
+    blocking forever.
+
+    Why this exists: a command that backgrounds work (`... &`) leaves that
+    process holding our stdout pipe, so EOF never arrives. Killing only the
+    direct child then makes communicate() wait for an EOF that can never come. start_new_session puts every
+    descendant in one group (pgid == pid), so SIGKILL to the group reaches the
+    leak. If something outside the group still holds the pipe we close it
+    ourselves rather than block: losing a partial tail beats a deadlock.
+    """
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        out, _ = proc.communicate(timeout=5)
+        return out or ""
+    except subprocess.TimeoutExpired as exc:
+        partial = exc.stdout or ""          # whatever we did read is better than nothing
+        if isinstance(partial, bytes):
+            partial = partial.decode(errors="replace")
+        for fh in (proc.stdout, proc.stderr):
+            if fh is not None and not fh.closed:
+                try:
+                    fh.close()
+                except OSError:
+                    pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        return partial
+
+
 def _bash(cfg, args, ctx):
     command = str(args.get("command", "")).strip()
     if not command:
@@ -263,8 +302,11 @@ def _bash(cfg, args, ctx):
     timeout = int(args.get("timeout_seconds") or getattr(cfg, "bash_timeout", 30))
     timeout = max(1, min(timeout, 300))
     interrupt = ctx.get("interrupt") if isinstance(ctx, dict) else None
+    # start_new_session: our own process group, so a timeout can kill every
+    # descendant (incl. backgrounded ones) instead of just the shell
     proc = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True, errors="replace")
+                            stderr=subprocess.STDOUT, text=True, errors="replace",
+                            start_new_session=True)
     deadline = time.time() + timeout
     timed_out = interrupted = False
     while True:  # poll so /stop can kill a running command mid-flight
@@ -274,13 +316,11 @@ def _bash(cfg, args, ctx):
         except subprocess.TimeoutExpired:
             if interrupt and interrupt():
                 interrupted = True
-                proc.kill()
-                out, _ = proc.communicate()
+                out = _kill_and_drain(proc)
                 break
             if time.time() >= deadline:
                 timed_out = True
-                proc.kill()
-                out, _ = proc.communicate()
+                out = _kill_and_drain(proc)
                 break
     out = out or ""
     if interrupted:
