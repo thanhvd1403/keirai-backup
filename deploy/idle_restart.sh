@@ -3,8 +3,12 @@
 # code fix goes live without killing a running turn. Mirrors the original
 # deploy watcher pattern (deploy.log: quiet>=1min, 30min budget) with a
 # more conservative quiet window. Armed manually; exits after restarting.
-LOG=/home/youruser/keirai/logs/keirai.log
-DEPLOY_LOG=/home/youruser/keirai/logs/deploy.log
+#
+# Repo root = parent of this script's deploy/ dir - derived, not hardcoded,
+# so it works in any clone and carries no account name into the file.
+BASE=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd) || exit 1
+LOG=$BASE/logs/keirai.log
+DEPLOY_LOG=$BASE/logs/deploy.log
 QUIET=300   # seconds of log silence = no turn in flight (reasoning gaps run ~150s max)
 BUDGET=1800 # give up after 30min of busy chat
 start=$(date +%s)

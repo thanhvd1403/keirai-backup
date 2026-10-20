@@ -57,6 +57,13 @@ keirai/
 
 Run tests: `python -m unittest discover -s tests`
 
+## Deploying / restarting
+
+- `deploy/keirai.service` is a **template**: `User=youruser` and the three `/home/youruser` paths must be edited before installing. Never copy it unedited into `/etc/systemd/system/` - that makes every start fail with `217/USER` (placeholder user does not resolve) while the *already-running* process keeps working, so the damage stays invisible until the next restart, when the bot won't come back up. This is easy to do by accident.
+- **`diff deploy/keirai.service /etc/systemd/system/keirai.service` before any copy.** Keep real account names and home paths out of commits - the repo must stay portable. If `/etc` was hand-edited in an emergency, copy it back here so the repo stays true.
+- `deploy/notify_stop.py` (via `ExecStopPost`) reports unexpected stops in the chat: silent on `success`, 30-min rate limit, always exits 0. Known gap: it inherits `User=`, so a failure *at the USER step* (bad path, unknown account) kills the notifier too - it can't report the very failure that stopped it. systemd 239's `+` prefix does not help (verified empirically); `OnFailure=` pointed at a root-run alert unit does (also verified).
+- `deploy/idle_restart.sh` derives the repo root from its own location, so it hardcodes no absolute paths. It restarts only after 5 min of log quiet, because a restart kills the in-flight turn - including this agent's own reply. `sudo systemctl restart keirai` is the manual equivalent.
+
 ## Current Status
 
 P0 + P1 + P2 + P3 + P4 complete and tested (293 tests). The bot does:
