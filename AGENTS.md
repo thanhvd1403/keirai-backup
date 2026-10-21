@@ -63,6 +63,12 @@ Run tests: `python -m unittest discover -s tests`
 - **`diff deploy/keirai.service /etc/systemd/system/keirai.service` before any copy.** Keep real account names and home paths out of commits - the repo must stay portable. If `/etc` was hand-edited in an emergency, copy it back here so the repo stays true.
 - `deploy/notify_stop.py` (via `ExecStopPost`) reports unexpected stops in the chat: silent on `success`, 30-min rate limit, always exits 0. Known gap: it inherits `User=`, so a failure *at the USER step* (bad path, unknown account) kills the notifier too - it can't report the very failure that stopped it. systemd 239's `+` prefix does not help (verified empirically); `OnFailure=` pointed at a root-run alert unit does (also verified).
 - `deploy/idle_restart.sh` derives the repo root from its own location, so it hardcodes no absolute paths. It restarts only after 5 min of log quiet, because a restart kills the in-flight turn - including this agent's own reply. `sudo systemctl restart keirai` is the manual equivalent.
+- **Memory**: the host is small, so keep a swapfile (also listed in
+  `/etc/fstab`) and treat a compiler/large build as the heaviest thing
+  that can run on it. The bash tool **reports processes left running
+  after a call returns** (`_survivors`) - backgrounded work survives its
+  tool call by design, so an unnoticed `make -j2` can otherwise keep
+  burning memory across later rounds.
 
 ## Current Status
 

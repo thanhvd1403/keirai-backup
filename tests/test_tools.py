@@ -1,6 +1,7 @@
 """Tests for the agent tool registry: files, shell safety, dispatch."""
 import os
 import shlex
+import signal
 import sys
 import tempfile
 import threading
@@ -32,6 +33,24 @@ def find_process(marker):
         if marker and marker in cmd:
             return cmd
     return None
+
+
+def kill_marker(marker):
+    """Best-effort sweep for leftovers a test spawned on purpose."""
+    me = os.getpid()
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit() or int(pid) == me:
+            continue
+        try:
+            with open("/proc/%s/cmdline" % pid, "rb") as fh:
+                cmd = fh.read().decode(errors="replace")
+        except OSError:
+            continue
+        if marker and marker in cmd:
+            try:
+                os.kill(int(pid), signal.SIGKILL)
+            except OSError:
+                pass
 
 
 def make_config(**kw):
@@ -191,6 +210,26 @@ class TestBash(unittest.TestCase):
             time.sleep(0.1)
         self.assertIsNone(find_process(marker),
                           "backgrounded process outlived the tool call")
+
+    def test_backgrounded_survivor_is_reported(self):
+        """Backgrounded work outlives the tool call on purpose (the model may
+        start long-lived things).
+        """
+        marker = "987323"
+        try:
+            # stdout redirected, as any backgrounding command should be: the
+            # call returns while the background work keeps going. (Without the
+            # redirect the child holds our stdout pipe, so the call would just
+            # wait out its timeout.)
+            out = tools.execute(self.cfg, "bash", {
+                "command": "( sleep %s >/dev/null 2>&1 ) & echo started" % marker,
+                "timeout_seconds": 10})
+            self.assertIn("started", out)
+            self.assertIn("left running", out)
+            self.assertIn(marker, out)
+        finally:
+            kill_marker(marker)
+        self.assertIsNone(find_process(marker), "the test leaked a process")
 
     def test_long_output_spilled_to_session_dir(self):
         """Output over tool_output_max_bytes is saved whole under

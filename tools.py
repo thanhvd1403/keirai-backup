@@ -291,6 +291,42 @@ def _kill_and_drain(proc):
         return partial
 
 
+def _survivors(proc):
+    """Processes still alive in this command's group after the call returns.
+
+    On the normal-return path we deliberately do NOT kill the group - the model
+    is allowed to start long-lived things (`nohup ... &`). But whatever it
+    backgrounds keeps burning resources *after* we have reported back. So: name them and let the model see
+    them, rather than silently leak them.
+
+    Returns (pgid, [(pid, cmdline), ...]); (None, []) when the group is gone.
+    Everything is matched by process group, so unrelated system processes can
+    never show up here.
+    """
+    # start_new_session=True makes the child a session+group leader, so its
+    # pgid IS its pid - usable even after communicate() has reaped it, which
+    # is exactly when we need it.
+    pgid = proc.pid
+    owner = os.getpid()
+    entries = []
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return pgid, entries
+    for pid in pids:
+        if int(pid) == owner:
+            continue
+        try:
+            if os.getpgid(int(pid)) != pgid:
+                continue
+            with open("/proc/%s/cmdline" % pid, "rb") as fh:
+                cmd = fh.read().decode(errors="replace").replace("\0", " ").strip()
+        except (OSError, ValueError):
+            continue
+        entries.append((pid, cmd[:140] or "?"))
+    return pgid, entries
+
+
 def _bash(cfg, args, ctx):
     command = str(args.get("command", "")).strip()
     if not command:
@@ -323,6 +359,17 @@ def _bash(cfg, args, ctx):
                 out = _kill_and_drain(proc)
                 break
     out = out or ""
+    # the group survives a normal return on purpose - report what it left behind
+    if not interrupted and not timed_out:
+        pgid, alive = _survivors(proc)
+        if alive:
+            lines = "\n".join("    pid %s pgid %s: %s" % (p, pgid, c)
+                              for p, c in alive[:5])
+            more = "" if len(alive) <= 5 else "\n    ... and %d more" % (len(alive) - 5)
+            out += ("\n[warning] left running after this tool call (these are NOT "
+                    "part of the output above):\n%s%s\n"
+                    "    they keep consuming resources - stop them with: kill -9 -%s\n"
+                    % (lines, more, pgid))
     if interrupted:
         header = "INTERRUPTED by the user (command did not finish; output below may be partial)\n"
     elif timed_out:
