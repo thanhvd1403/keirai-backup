@@ -30,6 +30,8 @@ log = logging.getLogger("keirai")
 CHARS_PER_TOKEN = 4  # ordinary ASCII text: this many chars per token
 IMAGE_KEEP = 4  # newest image-bearing messages whose pictures are re-sent
 COMPACT_FALLBACK_KEEP = 6  # floor of the last-resort trim (see chat_with_history)
+CALL_ARG_CHARS = 500  # tool-call arguments kept per call in a compaction summary
+CALL_BLOCK_CHARS = 2000  # ... and for all of one message's calls together
 REASONING_KEEP_CHARS = 4000  # reasoning kept per assistant message in context
                              # (tail only - conclusions live at the end)
 SESSION_ID = "keirai"  # anonymized x-opencode-session for the whole app (no chat ids)
@@ -1427,7 +1429,18 @@ def _compact(cfg, provider, api_key, model_id, history, session_id, keep=4,
         if isinstance(c, list):
             c = " ".join(p.get("text", "") for p in c if isinstance(p, dict)
                          and p.get("type") == "text")
-        line = "%s: %s" % (role, (c or "")[:4000])
+        c = c or ""
+        # Tool calls ride on the assistant message, never in `content`.
+        # Left out, the summary keeps results with no command behind them:
+        # "tool: exit code 0" and no idea what ran. Content is halved when
+        # calls are present so the two fit the same 4000-char line cap.
+        calls = "; ".join(
+            "%s %s" % ((f := tc.get("function") or {}).get("name") or "?",
+                       (f.get("arguments") or "")[:CALL_ARG_CHARS])
+            for tc in m.get("tool_calls") or [])
+        text = ("%s\n[calls: %s]" % (c[:2000], calls[:CALL_BLOCK_CHARS])
+                if calls else c)
+        line = "%s: %s" % (role, text[:4000])
         if transcript and size + len(line) > budget:
             break
         transcript.append(line)

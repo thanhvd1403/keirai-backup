@@ -508,6 +508,28 @@ class TestCompact(unittest.TestCase):
         self.assertEqual(hist[-1]["content"][:9], "message 9")
         self.assertIn("compacted: 10 -> 6 messages (~", self.tg.sent[-1][1])
 
+    @mock.patch.object(providers, "chat", return_value=("THE SUMMARY", "", None))
+    def test_compact_transcript_keeps_tool_calls(self, chat_mock):
+        """Tool arguments live in `tool_calls`, not `content`: a summary built
+        from content alone keeps the results with no command behind them."""
+        hist = self.state.get_history(100, None)
+        hist.extend([
+            {"role": "user", "content": "run the build"},
+            {"role": "assistant", "content": "Running it.",
+             "tool_calls": [{"id": "c1", "type": "function",
+                             "function": {"name": "bash",
+                                          "arguments": '{"command": "make -j2"}'}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "exit code 0"},
+            {"role": "assistant", "content": "built"},
+            {"role": "user", "content": "thanks"},
+            {"role": "assistant", "content": "anytime"},
+        ])
+        main.handle_message(self.cfg, self.tg, msg(text="/compact"), self.state)
+        sent = chat_mock.call_args[0][3][0]["content"]
+        self.assertIn("bash", sent)
+        self.assertIn("make -j2", sent)
+        self.assertIn("Running it.", sent)  # prose still there, just shortened
+
     def test_compact_nothing_to_do(self):
         self._seed(3)
         main.handle_message(self.cfg, self.tg, msg(text="/compact"), self.state)
