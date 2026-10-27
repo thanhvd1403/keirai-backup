@@ -136,13 +136,23 @@ class State:
             self.session_count[chat_id] = len(tids) + 1
 
     def persist(self, chat_id, thread_id):
-        """Write current session (history + model) through to the store."""
+        """Write current session (history + model) through to the store.
+
+        Also stamps last-agent-activity: this runs at every tool boundary and
+        at turn end (including a turn the user interrupted), so the stamp IS
+        "when the agent stopped working" - the timestamp the clock block puts
+        in front of the next user message. Stamped whether or not a store is
+        attached, because it is session state rather than a side effect of the
+        DB write; an empty history means the session was wiped, so the stamp
+        goes with it.
+        """
+        key = self.chat_key(chat_id, thread_id)
+        if self.history.get(key):
+            self.updated[key] = time.time()
         if not self.store:
             return
-        key = self.chat_key(chat_id, thread_id)
         self.store.save_session(chat_id, thread_id or 0, self.model.get(key),
                                 self.history.get(key) or [])
-        self.updated[key] = time.time()
         if not (self.history.get(key) or []):
             # history wiped -> the session (and its accumulators) is gone
             self.history.pop(key, None)
@@ -254,7 +264,9 @@ class State:
                               "cost_usd": 0.0, "tokens_in": 0,
                               "tokens_out": 0, "tokens_cached_read": 0,
                               "tokens_cached_write": 0}
-            self.updated[key] = time.time()
+            # NB: no updated[] stamp here - creating a session is not the agent
+            # doing work, and the clock block must read "first message" until
+            # a turn actually runs (persist() stamps that)
             if self.store:
                 self.store.create_session(chat_id, thread_id or 0, name)
 
@@ -268,6 +280,15 @@ class State:
 
     def get_history(self, chat_id, thread_id):
         return self.history.setdefault(self.chat_key(chat_id, thread_id), [])
+
+    def last_activity(self, chat_id, thread_id):
+        """Epoch of when this session's agent last did work.
+
+        persist() runs at every tool boundary and at turn end (including an
+        interrupted turn), so this is exactly "when it stopped working": the
+        last reply, or the last tool call of a run the user cut short. None
+        for a session that has never run a turn."""
+        return self.updated.get(self.chat_key(chat_id, thread_id)) or None
 
     def next_session_num(self, chat_id):
         with self._slot_lock:
@@ -1378,8 +1399,10 @@ def _history_tokens(history, cfg=None):
     is kept in context. With cfg, the system prompt is counted as well:
     it rides on every call."""
     n = sum(_msg_tokens(m) for m in history)
-    if cfg is not None and cfg.system_prompt:
-        n += _est_tokens(cfg.system_prompt)
+    if cfg is not None:
+        # SYSTEM.md - re-read like the request itself, so /context and the
+        # auto-compact threshold count what will actually be sent
+        n += _est_tokens(config_mod.system_prompt(cfg))
     return n
 
 
@@ -1678,6 +1701,49 @@ def _stream_answer(tg, msg, live, stop, provider, api_key, model_id, messages,
     return answer, reasoning, None
 
 
+def _fmt_ts(epoch):
+    """UTC stamp for the clock block: 2026-10-22 10:14:03 UTC."""
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(epoch)) + " UTC"
+
+
+def _fmt_ago(seconds):
+    """Elapsed time, compact: 7s / 12m 3s / 4h 9m / 3d 6h."""
+    seconds = int(max(0, seconds))
+    if seconds < 60:
+        return "%ds" % seconds
+    if seconds < 3600:
+        return "%dm %ds" % (seconds // 60, seconds % 60)
+    if seconds < 86400:
+        return "%dh %dm" % (seconds // 3600, (seconds % 3600) // 60)
+    return "%dd %dh" % (seconds // 86400, (seconds % 86400) // 3600)
+
+
+def _clock_block(state, chat_id, thread_id, now=None):
+    """The [time] block appended to the system prompt of every request.
+
+    The model has no clock and no awareness across turns: it cannot tell a
+    message that arrived seconds after its last reply from one that arrived a
+    day later. "now" plus "when you last worked on this session" (the last
+    reply, or the last tool call of a run the user cut short) lets it reason
+    about the gap - whether something it started has had time to finish, why
+    context may be stale, why the user is pinging.
+
+    Built once per turn, before this turn's own first persist(), so it always
+    describes the END OF THE PREVIOUS TURN rather than mid-turn work.
+    """
+    now = time.time() if now is None else now
+    last = state.last_activity(chat_id, thread_id)
+    if last:
+        when = "%s - %s ago" % (_fmt_ts(last), _fmt_ago(now - last))
+    else:
+        when = "none (first message in this session)"
+    return ("[time]\n"
+            "now: %s\n"
+            "your last activity in this session: %s\n"
+            "(the gap above is how long this session sat idle before this "
+            "message)" % (_fmt_ts(now), when))
+
+
 INTERRUPT_NOTE = ("[This run was interrupted by the user before it finished - "
                   "any running command/tool did not complete.]")
 
@@ -1848,8 +1914,15 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
 
     _close_tool_rounds(history)  # safety net: no dangling tool_calls ever
     # the WHOLE session goes to the model - no message cap (auto-compact bounds size)
-    messages = ([{"role": "system", "content": cfg.system_prompt}]
-                if cfg.system_prompt else []) + _prompt(history)
+    # system prompt = SYSTEM.md, re-read on every request so an edit lands on
+    # the very next message, plus the [time] block (now + when this session
+    # last had agent activity - computed before this turn's first persist, so
+    # it describes the previous turn's end, not work in progress)
+    sys_text = config_mod.system_prompt(cfg)
+    clock = _clock_block(state, chat_id, thread_id)
+    sys_text = ("%s\n\n%s" % (sys_text, clock)) if sys_text else clock
+    messages = ([{"role": "system", "content": sys_text}]
+                if sys_text else []) + _prompt(history)
     tool_specs = tools_mod.available_specs(cfg)
     # the tool names THIS request offers - the guard for calls parsed out of
     # text, which cannot distinguish a real call from markup the model merely

@@ -229,6 +229,15 @@ class TestBash(unittest.TestCase):
             self.assertIn(marker, out)
         finally:
             kill_marker(marker)
+            # SIGKILL is asynchronous: the /proc entry stays readable until the
+            # kernel reaps it, and a refork can race a single sweep - so poll
+            # and re-sweep instead of asserting on one instant. (One run in
+            # ~3 failed on exactly that window.)
+            for _ in range(50):
+                if not find_process(marker):
+                    break
+                time.sleep(0.1)
+                kill_marker(marker)
         self.assertIsNone(find_process(marker), "the test leaked a process")
 
     def test_long_output_spilled_to_session_dir(self):

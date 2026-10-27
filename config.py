@@ -157,3 +157,26 @@ def cache_dir(config):
 def sessions_path(config):
     """SQLite session db path next to the config file (or ./sessions.db)."""
     return os.path.join(base_dir(config), "sessions.db")
+
+
+SYSTEM_FILE = "SYSTEM.md"
+
+
+def system_prompt(config):
+    """The system prompt for this request: SYSTEM.md next to the config file.
+
+    Read on EVERY call and never cached, deliberately: an edit to SYSTEM.md
+    must be visible to the very next user message, not from the next process
+    restart. Falls back to config.toml's system_prompt (then the built-in
+    default) when the file is missing or empty, so a repo without SYSTEM.md
+    keeps working.
+    """
+    try:
+        with open(os.path.join(base_dir(config), SYSTEM_FILE),
+                  encoding="utf-8") as fh:
+            text = fh.read().strip()
+        if text:
+            return text
+    except OSError:
+        pass
+    return config.system_prompt

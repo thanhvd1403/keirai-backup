@@ -41,6 +41,7 @@ keirai/
 ├── deploy/keirai.service# systemd unit (keep-alive + autostart + ExecStopPost death notice)
 ├── deploy/notify_stop.py # ExecStopPost: reports OOM/kill deaths in the chat (stdlib-only, no repo imports, rate-limited)
 ├── deploy/install_lightpanda.sh # installs the browser binary into ./tools/
+├── SYSTEM.md            # System prompt - re-read on EVERY request, so an edit is live on the very next message
 ├── config.example.toml  # Config template (TOML, comments allowed)
 └── tests/               # Unit tests (unittest, stdlib)
     ├── test_md2tg.py    #   markdown conversion, splitting, rich split, tables, lists
@@ -75,6 +76,7 @@ Run tests: `python -m unittest discover -s tests`
 P0 + P1 + P2 + P3 + P4 complete and tested (293 tests). The bot does:
 - Long polling with access control (allow-list by user ID/username, or allow all)
 - Config in TOML (`config.toml`, comments allowed) with env overrides
+- System prompt lives in `SYSTEM.md` (fallback: `system_prompt` in config.toml) and is **re-read on every request**, so an edit reaches the very next user message with no restart; every request also carries a `[time]` block - current time plus when this session's agent last worked (last reply, or last tool call of a run the user interrupted) - so the model can tell a quiet minute from a quiet day
 - AI chat via OpenCode Zen / OpenCode Go (OpenAI-compatible), history persisted per session in SQLite
 - Sessions via Telegram topics (Bot API 9.3+ private-chat topics - enable "Threaded mode" in the @BotFather Mini App): `/new [name]`, `/rename <name>`, per-topic context isolation; `/reset-all` wipes everything (2-string confirmation, deletes tracked topics)
 - AI answers sent as Bot API 10.1 Rich Messages: markdown passthrough (native tables, task lists, headings, formulas, 32k chars), thinking as collapsible `<details>`; `rich_messages` config toggle + automatic fallback to regular messages

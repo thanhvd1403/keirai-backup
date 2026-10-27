@@ -84,6 +84,36 @@ class TestConfig(unittest.TestCase):
                 cfg = config_mod.load()
             self.assertEqual(cfg.system_prompt, "line one\nline two")
 
+    def test_system_prompt_from_system_md_is_live_per_call(self):
+        """SYSTEM.md wins over config.toml and is re-read on EVERY call, so an
+        edit reaches the very next user message instead of waiting for a
+        restart; a missing or blank file falls back to config.toml."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "config.toml")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write('bot_token = "tok"\nsystem_prompt = "from toml"\n')
+            with mock.patch.dict(os.environ, {"KEIRAI_CONFIG": p}, clear=False):
+                cfg = config_mod.load()
+            sp = os.path.join(d, config_mod.SYSTEM_FILE)
+
+            # no file yet -> config.toml
+            self.assertEqual(config_mod.system_prompt(cfg), "from toml")
+
+            with open(sp, "w", encoding="utf-8") as f:
+                f.write("first prompt\n")
+            self.assertEqual(config_mod.system_prompt(cfg), "first prompt")
+
+            # same process, no reload, no restart: edit is visible immediately
+            with open(sp, "w", encoding="utf-8") as f:
+                f.write("second prompt\n")
+            self.assertEqual(config_mod.system_prompt(cfg), "second prompt")
+
+            # blank file is not a usable prompt -> fall back, don't send ""
+            with open(sp, "w", encoding="utf-8") as f:
+                f.write("   \n")
+            self.assertEqual(config_mod.system_prompt(cfg), "from toml")
+
 
 if __name__ == "__main__":
     unittest.main()

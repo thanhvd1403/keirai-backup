@@ -8,6 +8,7 @@ from unittest import mock
 
 import main
 import providers
+import config as config_mod
 
 
 class FakeTG:
@@ -2096,9 +2097,11 @@ class TestContextCostCommands(unittest.TestCase):
                          + main._est_tokens("RESULT-OUTPUT")
                          + main._est_tokens("done"))
         self.assertEqual(main._history_tokens(history), 19)
-        # with cfg the system prompt rides along (it is sent on every call)
+        # with cfg the system prompt rides along (it is sent on every call) -
+        # that is SYSTEM.md now, re-read like the request itself
+        import config as config_mod
         self.assertEqual(main._history_tokens(history, self.cfg),
-                         19 + main._est_tokens(self.cfg.system_prompt))
+                         19 + main._est_tokens(config_mod.system_prompt(self.cfg)))
         main.handle_message(self.cfg, self.tg, msg(text="/context"), self.state)
         text = self.tg.sent[-1][1]
         self.assertNotIn("<b>history</b>", text)   # the split line is gone
@@ -2879,6 +2882,89 @@ class TestConfigPersistence(unittest.TestCase):
                 lines = [l for l in f.read().splitlines() if l.strip()]
             self.assertEqual(lines[1], "topic_flow = true")  # before any section
             self.assertEqual(lines[2], "[providers.zen]")
+
+
+class TestSystemPromptAndClock(unittest.TestCase):
+    """SYSTEM.md as the system prompt (live per request) and the [time] block
+    that tells the model the current time plus when this session's agent last
+    worked, so it can tell a quiet minute from a quiet day."""
+
+    def setUp(self):
+        self.tg = FakeTG()
+        self.state = main.State(True)
+        disable_titles(self)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = config_mod.Config(
+            {"bot_token": "t", "allowed_users": [42], "stream_drafts": False,
+             "rich_messages": True, "context_limit_tokens": 30_000,
+             "providers": {"zen": {"api_key": "zk"}, "go": {"api_key": "gk"}}},
+            path=os.path.join(self.tmp.name, "config.toml"))
+        self._write_system("FIRST SYSTEM PROMPT")
+
+    def _write_system(self, text):
+        with open(os.path.join(self.tmp.name, config_mod.SYSTEM_FILE), "w",
+                  encoding="utf-8") as fh:
+            fh.write(text + "\n")
+
+    def _run_turn(self, text):
+        """Drive one turn and return the messages sent to the model."""
+        seen = {}
+
+        def fake(name, api_key, model, messages, **kw):
+            seen["messages"] = messages
+            return "ok", "", None
+
+        with mock.patch.object(providers, "chat", side_effect=fake), \
+                mock.patch.object(providers, "price_for", return_value=None):
+            main.handle_message(self.cfg, self.tg, msg(text=text), self.state)
+        return seen.get("messages") or []
+
+    @staticmethod
+    def _system(messages):
+        return [m for m in messages if m.get("role") == "system"]
+
+    def test_first_message_carries_file_prompt_and_clock(self):
+        msgs = self._run_turn("hello")
+        sys_msgs = self._system(msgs)
+        self.assertTrue(sys_msgs, "no system message was sent")
+        content = sys_msgs[0]["content"]
+        self.assertIn("FIRST SYSTEM PROMPT", content)   # from SYSTEM.md
+        self.assertIn("[time]", content)
+        self.assertIn("UTC", content)                   # current time present
+        self.assertIn("none (first message in this session)", content)
+
+    def test_system_prompt_edit_is_live_on_the_next_message(self):
+        """No restart, no reload: the second turn must already carry the
+        rewritten SYSTEM.md."""
+        self._run_turn("hello")
+        self._write_system("SECOND SYSTEM PROMPT")
+        content = self._system(self._run_turn("hello again"))[0]["content"]
+        self.assertIn("SECOND SYSTEM PROMPT", content)
+        self.assertNotIn("FIRST SYSTEM PROMPT", content)
+
+    def test_clock_reports_the_gap_since_the_previous_turn(self):
+        self._run_turn("hello")
+        content = self._system(self._run_turn("hello again"))[0]["content"]
+        self.assertNotIn("none (first message", content)
+        self.assertIn(" ago", content)      # last activity -> elapsed gap
+        self.assertIn("UTC", content)
+
+    def test_clock_block_formatting(self):
+        self.assertEqual(main._fmt_ago(7), "7s")
+        self.assertEqual(main._fmt_ago(75), "1m 15s")
+        self.assertEqual(main._fmt_ago(3 * 3600 + 9 * 60), "3h 9m")
+        self.assertEqual(main._fmt_ago(3 * 86400 + 6 * 3600), "3d 6h")
+        self.assertEqual(main._fmt_ago(-5), "0s")       # clock skew: never negative
+
+    def test_last_activity_follows_the_session_not_the_object(self):
+        state = main.State(True)
+        self.assertIsNone(state.last_activity(1, None))  # never ran a turn
+        history = state.get_history(1, None)
+        history.append({"role": "user", "content": "hi"})
+        state.persist(1, None)   # what a tool boundary / turn end does
+        self.assertIsNotNone(state.last_activity(1, None))
+        self.assertIsNone(state.last_activity(2, None))  # other chat untouched
 
 
 if __name__ == "__main__":
