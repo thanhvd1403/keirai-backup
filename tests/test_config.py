@@ -73,32 +73,23 @@ class TestConfig(unittest.TestCase):
                 with self.assertRaises(config_mod.ConfigError):
                     config_mod.load()
 
-    def test_multiline_system_prompt(self):
-        import tempfile
-        toml = 'system_prompt = """line one\nline two"""\n'
-        with tempfile.TemporaryDirectory() as d:
-            p = os.path.join(d, "config.toml")
-            with open(p, "w", encoding="utf-8") as f:
-                f.write(toml)
-            with mock.patch.dict(os.environ, {"KEIRAI_CONFIG": p}, clear=False):
-                cfg = config_mod.load()
-            self.assertEqual(cfg.system_prompt, "line one\nline two")
-
     def test_system_prompt_from_system_md_is_live_per_call(self):
-        """SYSTEM.md wins over config.toml and is re-read on EVERY call, so an
-        edit reaches the very next user message instead of waiting for a
-        restart; a missing or blank file falls back to config.toml."""
+        """SYSTEM.md is re-read on EVERY call, so an edit reaches the very next
+        user message instead of waiting for a restart; a missing or blank file
+        falls back to the hardcoded DEFAULT_SYSTEM_PROMPT (the file is
+        gitignored, so a fresh clone has none)."""
         import tempfile
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "config.toml")
             with open(p, "w", encoding="utf-8") as f:
-                f.write('bot_token = "tok"\nsystem_prompt = "from toml"\n')
+                f.write('bot_token = "tok"\n')
             with mock.patch.dict(os.environ, {"KEIRAI_CONFIG": p}, clear=False):
                 cfg = config_mod.load()
             sp = os.path.join(d, config_mod.SYSTEM_FILE)
 
-            # no file yet -> config.toml
-            self.assertEqual(config_mod.system_prompt(cfg), "from toml")
+            # no file yet -> the built-in default, never an empty prompt
+            self.assertEqual(config_mod.system_prompt(cfg),
+                             config_mod.DEFAULT_SYSTEM_PROMPT)
 
             with open(sp, "w", encoding="utf-8") as f:
                 f.write("first prompt\n")
@@ -109,10 +100,11 @@ class TestConfig(unittest.TestCase):
                 f.write("second prompt\n")
             self.assertEqual(config_mod.system_prompt(cfg), "second prompt")
 
-            # blank file is not a usable prompt -> fall back, don't send ""
+            # blank file is not a usable prompt -> default, not ""
             with open(sp, "w", encoding="utf-8") as f:
                 f.write("   \n")
-            self.assertEqual(config_mod.system_prompt(cfg), "from toml")
+            self.assertEqual(config_mod.system_prompt(cfg),
+                             config_mod.DEFAULT_SYSTEM_PROMPT)
 
 
 if __name__ == "__main__":

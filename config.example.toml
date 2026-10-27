@@ -28,11 +28,10 @@ tool_output_max_bytes = 40000            # tool output over this (bytes; 40000 =
 default_model = "go/mimo-v2.6-flash"      # provider/model-id (Go is tried first; Zen is the error fallback)
 topic_flow = false                       # sessions live in Telegram topics; run /topic to switch modes (then /new)
 max_file_mb = 20                         # download size cap
-# The system prompt now lives in SYSTEM.md next to this file: it is re-read on
-# EVERY request, so editing SYSTEM.md takes effect on the very next user
-# message - no restart needed. The value below is only the fallback used when
-# SYSTEM.md is missing or empty.
-system_prompt = """You are Keirai, a lightweight AI agent running on a small server. Answer using markdown."""
+# The system prompt lives in SYSTEM.md next to this file (gitignored, local to
+# this machine) and is re-read on EVERY request, so editing it takes effect on
+# the very next user message. When it is missing or empty the built-in
+# DEFAULT_SYSTEM_PROMPT in config.py is used.
 
 [providers.zen]
 api_key = ""                             # from opencode.ai console

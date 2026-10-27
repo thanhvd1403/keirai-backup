@@ -58,7 +58,6 @@ class Config:
         #   edit  - legacy in-place edits of a placeholder message
         mode = str(data.get("stream_mode", "draft")).strip().lower()
         self.stream_mode = mode if mode in ("draft", "edit") else "draft"
-        self.system_prompt = data.get("system_prompt", "You are Keirai, a lightweight AI agent.")
         providers = data.get("providers", {}) or {}
         self.providers = {}
         for name, env_keys in PROVIDER_ENV_KEYS.items():
@@ -161,15 +160,19 @@ def sessions_path(config):
 
 SYSTEM_FILE = "SYSTEM.md"
 
+# Used when SYSTEM.md is missing or blank - it is gitignored, so a fresh clone
+# has none. Kept in code so the bot always has a working prompt.
+DEFAULT_SYSTEM_PROMPT = ("You are Keirai, a lightweight AI agent running on a "
+                         "small server. Answer using markdown.")
+
 
 def system_prompt(config):
     """The system prompt for this request: SYSTEM.md next to the config file.
 
     Read on EVERY call and never cached, deliberately: an edit to SYSTEM.md
     must be visible to the very next user message, not from the next process
-    restart. Falls back to config.toml's system_prompt (then the built-in
-    default) when the file is missing or empty, so a repo without SYSTEM.md
-    keeps working.
+    restart. The file is not tracked by git - it holds the local prompt - so a
+    missing or blank one falls back to DEFAULT_SYSTEM_PROMPT above.
     """
     try:
         with open(os.path.join(base_dir(config), SYSTEM_FILE),
@@ -179,4 +182,4 @@ def system_prompt(config):
             return text
     except OSError:
         pass
-    return config.system_prompt
+    return DEFAULT_SYSTEM_PROMPT
