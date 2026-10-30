@@ -61,16 +61,26 @@ class Store:
             self.conn.commit()
 
     def _backfill_meta(self):
-        """Give pre-existing sessions a session id; fill any NULL ids."""
+        """Give pre-existing sessions a session id; fill any NULL ids.
+
+        Steady state this writes NOTHING: an unconditional UPDATE opened a
+        write transaction at every startup and cost a commit+fsync on a
+        database that already had its ids (measured 500ms of a 1.8s boot on
+        this disk). The queries below only insert what is actually missing."""
         rows = self.conn.execute(
-            "SELECT chat_id, thread_id, updated_at FROM sessions").fetchall()
+            "SELECT s.chat_id, s.thread_id, s.updated_at FROM sessions s "
+            "LEFT JOIN session_meta m ON m.chat_id = s.chat_id "
+            "AND m.thread_id = s.thread_id WHERE m.session_id IS NULL").fetchall()
         for chat_id, thread_id, updated in rows:
             self.conn.execute(
                 "INSERT OR IGNORE INTO session_meta (chat_id, thread_id, session_id) "
                 "VALUES (?, ?, ?)", (chat_id, thread_id, new_session_id(updated)))
-        self.conn.execute(
-            "UPDATE session_meta SET session_id=? WHERE session_id IS NULL",
-            (new_session_id(),))
+        nulls = self.conn.execute(
+            "SELECT COUNT(*) FROM session_meta WHERE session_id IS NULL").fetchone()[0]
+        if nulls:
+            self.conn.execute(
+                "UPDATE session_meta SET session_id=? WHERE session_id IS NULL",
+                (new_session_id(),))
 
     # ------------------------------------------------ sessions
 

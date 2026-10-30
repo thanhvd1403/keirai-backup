@@ -2833,13 +2833,19 @@ def main():
                  "on" if state.allows_user_topics else "off")
     except tg_mod.TelegramError as e:
         log.error("getMe failed: %s (continuing without topic support)", e)
-    try:
-        tg.call("setMyCommands", {"commands": [
-            {"command": name, "description": desc}
-            for name, (fn, desc, hidden) in sorted(COMMANDS.items()) if not hidden
-        ]})
-    except tg_mod.TelegramError as e:
-        log.warning("setMyCommands failed: %s", e)
+    def _publish_commands():
+        """The bot menu is not needed to receive messages - an RTT spent on
+        cosmetics delayed every restart by ~0.5s, so it runs alongside the
+        poller instead of in front of it."""
+        try:
+            tg.call("setMyCommands", {"commands": [
+                {"command": name, "description": desc}
+                for name, (fn, desc, hidden) in sorted(COMMANDS.items()) if not hidden
+            ]})
+        except tg_mod.TelegramError as e:
+            log.warning("setMyCommands failed: %s", e)
+
+    threading.Thread(target=_publish_commands, daemon=True, name="commands").start()
     log.info("polling... (default model: %s)", cfg.default_model)
     out_q = queue.Queue()
     threading.Thread(target=_watch_updates, args=(cfg, tg, state, out_q),
