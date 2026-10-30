@@ -3002,17 +3002,17 @@ class TestRestartCommand(unittest.TestCase):
         self.cfg = make_config()
         disable_titles(self)
 
-    def test_restart_in_main_chat_is_silent(self):
-        """No "restarting..." reply: the start notifier is the confirmation
-        that the restart actually took, and it only speaks once the poll loop
-        is live."""
+    def test_restart_in_main_chat_acknowledges(self):
+        """One reply: the command was received. The restart itself is
+        confirmed later by the start notifier, once the poll loop is live."""
         with mock.patch.object(main, "_restart_pending", return_value=False), \
              mock.patch.object(main, "_mark_restart_requested"), \
              mock.patch.object(main, "_code_imports", return_value=(True, "")), \
              mock.patch.object(main, "_schedule_restart") as sched:
             main.handle_message(self.cfg, self.tg, msg(text="/restart"), self.state)
         self.assertEqual(sched.call_count, 1)
-        self.assertEqual(self.tg.sent, [])
+        self.assertIn("restarting now", self.tg.sent[-1][1])
+        self.assertEqual(len(self.tg.sent), 1)  # exactly one message
 
     def test_restart_refused_when_code_does_not_import(self):
         """A restart into broken code leaves no bot to send /restart again:

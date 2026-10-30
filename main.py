@@ -1033,10 +1033,10 @@ def cmd_restart(cfg, tg, msg, thread_id, state):
         tg.send(chat_id, "restart failed: <code>%s</code>" % html.escape(str(e)[:300]),
                 thread_id)
         return
-    # No acknowledgement: the start notifier says "I'm back" only once the
-    # poll loop is live, and that is the one message worth sending. A reply
-    # here would confirm the command was typed, not that the restart worked.
     log.info("restart requested from chat=%s thread=%s", chat_id, thread_id)
+    # Say it was received - this confirms the command, not the restart. The
+    # start notifier does the other half, once the poll loop is actually live.
+    tg.send(chat_id, "restarting now - I'll message you when I'm back", thread_id)
 
 
 @command("compact", "summarize older context now to free space (also runs automatically)")
