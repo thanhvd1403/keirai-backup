@@ -3004,10 +3004,43 @@ class TestRestartCommand(unittest.TestCase):
         """No "restarting..." reply: the start notifier is the confirmation
         that the restart actually took, and it only speaks once the poll loop
         is live."""
-        with mock.patch.object(main, "_schedule_restart") as sched:
+        with mock.patch.object(main, "_code_imports", return_value=(True, "")), \
+             mock.patch.object(main, "_schedule_restart") as sched:
             main.handle_message(self.cfg, self.tg, msg(text="/restart"), self.state)
         self.assertEqual(sched.call_count, 1)
         self.assertEqual(self.tg.sent, [])
+
+    def test_restart_refused_when_code_does_not_import(self):
+        """A restart into broken code leaves no bot to send /restart again:
+        the guard must keep the RUNNING one alive and say why."""
+        boom = "Traceback (most recent call last):\nSyntaxError: invalid syntax"
+        with mock.patch.object(main, "_code_imports", return_value=(False, boom)), \
+             mock.patch.object(main, "_schedule_restart") as sched:
+            main.handle_message(self.cfg, self.tg, msg(text="/restart"), self.state)
+        self.assertEqual(sched.call_count, 0)          # never scheduled
+        self.assertIn("does not import", self.tg.sent[-1][1])
+        self.assertIn("SyntaxError", self.tg.sent[-1][1])
+
+    def test_import_guard_catches_a_broken_tree(self):
+        """Real check, real subprocess: a package that fails to import."""
+        import subprocess, tempfile, textwrap
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "main.py"), "w") as fh:
+                fh.write(textwrap.dedent("""
+                    import definitely_not_a_real_module_xyz
+                """))
+            ok, err = main._code_imports(d)
+        self.assertFalse(ok)
+        self.assertIn("definitely_not_a_real_module_xyz", err)
+
+    def test_import_guard_passes_on_a_sound_tree(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "main.py"), "w") as fh:
+                fh.write("value = 1\n")
+            ok, err = main._code_imports(d)
+        self.assertTrue(ok)
+        self.assertEqual(err, "")
 
     def test_restart_refused_inside_a_topic(self):
         self.cfg.topic_flow = True  # else the topic message is ignored outright

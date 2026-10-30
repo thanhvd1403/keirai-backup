@@ -924,6 +924,29 @@ def cmd_stop(cfg, tg, msg, thread_id, state):
 
 
 SERVICE_UNIT = "keirai.service"  # the unit this process runs under
+IMPORT_CHECK_TIMEOUT = 30  # seconds before a hanging import counts as broken
+
+
+def _code_imports(base_dir):
+    """Import the tree in a throwaway process. Returns (ok, error_tail).
+
+    /restart boots whatever is on disk. If that does not import, the bot
+    never comes back and there is no bot left to send /restart again - the
+    crash loop repeats every RestartSec and only SSH can fix it. So the code
+    is imported first, in a child: ~117ms and ~24MB, once, on an explicit
+    human command. A traceback is worth paying that for."""
+    try:
+        proc = subprocess.run([sys.executable, "-c", "import main"], cwd=base_dir,
+                              capture_output=True, text=True,
+                              timeout=IMPORT_CHECK_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return False, "import did not finish within %ds" % IMPORT_CHECK_TIMEOUT
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, "import check could not run: %s" % e
+    if proc.returncode == 0:
+        return True, ""
+    return False, (proc.stderr or proc.stdout or "").strip()[-600:]
+
 
 
 def _schedule_restart(delay=1):
@@ -954,6 +977,13 @@ def cmd_restart(cfg, tg, msg, thread_id, state):
     if thread_id:
         tg.send(chat_id, "restart only works in the main chat - run it in "
                 "All messages", thread_id)
+        return
+    ok, err = _code_imports(config_mod.base_dir(cfg))
+    if not ok:
+        log.warning("restart refused, code does not import: %s", err[-200:])
+        tg.send(chat_id, "not restarting - the code on disk does not import, "
+                "and I would not come back:\n<pre>%s</pre>" % html.escape(err),
+                thread_id)
         return
     try:
         _schedule_restart()
