@@ -82,6 +82,7 @@ Talk to the bot; it replies with your session's history. Main commands
 | `/cost` | alias of `/context` - the same report |
 | `/compact` | summarize older context now (also runs automatically) |
 | `/stop` | interrupt the reply/tool currently running |
+| `/restart` | restart keirai now (main chat only; the bot messages you when it is back) |
 | `/thinking on\|off` | show/hide AI reasoning |
 | `/topic` | switch between normal chat and topic flow |
 | `/test_md`, `/test_rich` | check message rendering |

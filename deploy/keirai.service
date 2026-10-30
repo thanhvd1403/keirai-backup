@@ -48,6 +48,12 @@ Environment=PYTHONUNBUFFERED=1
 # ($SERVICE_RESULT says why). deploy/notify_stop.py - silent on clean stops,
 # rate-limited so a crash loop pings once.
 ExecStopPost=/usr/bin/python3 /home/youruser/keirai/deploy/notify_stop.py
+# welcome back: runs at start but WAITS for readiness (unit active, PID alive,
+# Telegram getMe answering), then says so in the chat - "restarted" should be
+# confirmed, not assumed. Detaches, so systemd does not wait. Silent when it
+# cannot confirm, and rate-limited so a crash loop announces once.
+# deploy/notify_start.py
+ExecStartPost=/usr/bin/python3 /home/youruser/keirai/deploy/notify_start.py --detach
 
 [Install]
 WantedBy=multi-user.target

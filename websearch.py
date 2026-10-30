@@ -22,9 +22,17 @@ MAX_QUERIES = 3        # one Exa search call per query, at most this many
 RESULTS_PER_QUERY = 5  # numResults for web_search_exa
 EXCERPT_CHARS = 6000   # web_fetch_exa default is 3000 - keep more context
 FULL_CHARS = 60000     # full_content=true: as much of the page as fits
-# Exa answers a throttled search with plain text content (not isError)
-QUOTA_MARK = "rate limit"
-QUOTA_MAX_CHARS = 600  # a throttle notice is short; real results are long
+# Exa answers a throttled search with plain text content (not isError).
+# These are the notices themselves, not "rate limit" anywhere in a page:
+# real results talk about rate limits constantly, and one of them saying so
+# used to throw away a whole answer. An empty result set is short text too,
+# so length is no signal either - only these phrases are.
+QUOTA_MARKS = (
+    "hit exa's free mcp rate limit",
+    "rate limit exceeded",
+    "rate limit reached",
+    "too many requests",
+)
 
 
 class MCPError(Exception):
@@ -128,14 +136,13 @@ def _check_quota(text):
     """Exa reports a throttled search as ordinary content, not as an error -
     raise instead of handing the model a rate-limit notice as 'results'.
 
-    Only a short message counts: real results run to thousands of chars and
-    routinely *mention* rate limits (any page about APIs does), so a bare
-    substring match turned ordinary answers into errors."""
-    text = (text or "").strip()
-    if len(text) > QUOTA_MAX_CHARS:
-        return
-    if QUOTA_MARK in text.lower():
-        raise MCPError(text)
+    Matched on the notice's own wording (QUOTA_MARKS). Not on "rate limit"
+    (real pages mention it constantly) and not on length (an empty result
+    set is short too)."""
+    low = (text or "").lower()
+    for mark in QUOTA_MARKS:
+        if mark in low:
+            raise MCPError(text.strip())
 
 
 # ---------------------------------------------------------------- tools

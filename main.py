@@ -13,6 +13,7 @@ import queue
 import re
 import secrets
 import string
+import subprocess
 import sys
 import threading
 import time
@@ -920,6 +921,48 @@ def cmd_stop(cfg, tg, msg, thread_id, state):
     """Reaches the main loop only when no turn is running - the watcher
     consumes /stop during an active turn and interrupts it directly."""
     tg.send(msg["chat"]["id"], "nothing is running right now", thread_id)
+
+
+SERVICE_UNIT = "keirai.service"  # the unit this process runs under
+
+
+def _schedule_restart(delay=1):
+    """Queue a restart of our own unit from OUTSIDE this service's cgroup.
+
+    `systemctl restart keirai` run from inside the service kills the caller
+    mid-job (KillMode=control-group: the restart tears down the cgroup that
+    holds the command doing the asking). systemd-run creates a transient
+    timer unit - in its own cgroup - which fires the restart `delay` seconds
+    later, long enough for the reply to leave. `sudo -n` fails fast instead
+    of blocking on a password prompt that nobody can answer."""
+    cmd = ["sudo", "-n", "systemd-run", "--collect", "--quiet",
+           "--on-active=%d" % delay,
+           "--unit=keirai-restart-%d" % int(time.time()),
+           "/bin/systemctl", "restart", SERVICE_UNIT]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or proc.stdout or "systemd-run failed").strip()[:300])
+
+
+@command("restart", "restart keirai now (main chat only)")
+def cmd_restart(cfg, tg, msg, thread_id, state):
+    """Restart from Telegram. Main chat only: restarting from inside a topic
+    drops you somewhere you did not choose, and a topic-bound session is the
+    state most worth not disturbing. History lives in sqlite, so the session
+    survives."""
+    chat_id = msg["chat"]["id"]
+    if thread_id:
+        tg.send(chat_id, "restart only works in the main chat - run it in "
+                "All messages", thread_id)
+        return
+    try:
+        _schedule_restart()
+    except Exception as e:  # noqa: BLE001 - reported, never raised at Telegram
+        log.warning("restart scheduling failed: %s", e)
+        tg.send(chat_id, "restart failed: <code>%s</code>" % html.escape(str(e)[:300]),
+                thread_id)
+        return
+    tg.send(chat_id, "restarting now - I'll message you when I'm back", thread_id)
 
 
 @command("compact", "summarize older context now to free space (also runs automatically)")

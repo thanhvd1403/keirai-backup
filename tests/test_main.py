@@ -2991,3 +2991,44 @@ class TestSystemPromptAndClock(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRestartCommand(unittest.TestCase):
+    def setUp(self):
+        self.tg = FakeTG()
+        self.state = main.State(True)
+        self.cfg = make_config()
+        disable_titles(self)
+
+    def test_restart_in_main_chat_schedules(self):
+        with mock.patch.object(main, "_schedule_restart") as sched:
+            main.handle_message(self.cfg, self.tg, msg(text="/restart"), self.state)
+        self.assertEqual(sched.call_count, 1)
+        self.assertIn("restarting now", self.tg.sent[-1][1])
+
+    def test_restart_refused_inside_a_topic(self):
+        self.cfg.topic_flow = True  # else the topic message is ignored outright
+        with mock.patch.object(main, "_schedule_restart") as sched:
+            main.handle_message(self.cfg, self.tg,
+                                msg(text="/restart", message_thread_id=77), self.state)
+        self.assertEqual(sched.call_count, 0)
+        self.assertIn("main chat", self.tg.sent[-1][1])
+
+    def test_restart_reports_scheduling_failure(self):
+        with mock.patch.object(main, "_schedule_restart",
+                               side_effect=RuntimeError("sudo: a password is required")):
+            main.handle_message(self.cfg, self.tg, msg(text="/restart"), self.state)
+        self.assertIn("restart failed", self.tg.sent[-1][1])
+        self.assertIn("password", self.tg.sent[-1][1])
+
+    def test_restart_survives_its_own_cgroup(self):
+        """The restart must be queued outside this service's cgroup, or the
+        kill takes the command that asked for it."""
+        with mock.patch.object(main.subprocess, "run") as run:
+            run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+            main._schedule_restart()
+        argv = run.call_args[0][0]
+        self.assertEqual(argv[:3], ["sudo", "-n", "systemd-run"])
+        self.assertTrue(any(a.startswith("--on-active=") for a in argv))
+        self.assertIn("restart", argv)
+        self.assertIn(main.SERVICE_UNIT, argv)

@@ -196,12 +196,27 @@ class TestRequestHeaders(unittest.TestCase):
 
 
 class TestQuotaDetection(unittest.TestCase):
-    def test_short_notice_raises(self):
-        with self.assertRaises(websearch.MCPError):
-            websearch._check_quota("Rate limit exceeded. Add an API key or try again later.")
+    # the notice exactly as the anonymous tier returns it
+    NOTICE = ("You've hit Exa's free MCP rate limit. To continue using without "
+              "limits, create your own Exa API key.\n\nFix: Create API key at "
+              "https://dashboard.exa.ai/api-keys , and then update Exa MCP URL")
 
-    def test_long_result_mentioning_rate_limits_passes(self):
-        """Real results talk about rate limits; only a short notice is a throttle."""
-        page = ("### query\nTitle: Exa MCP\n" + "Exa offers a free rate limit. " * 60)
-        self.assertGreater(len(page), websearch.QUOTA_MAX_CHARS)
+    def test_real_notice_raises(self):
+        with self.assertRaises(websearch.MCPError):
+            websearch._check_quota(self.NOTICE)
+
+    def test_notice_among_long_results_raises(self):
+        with self.assertRaises(websearch.MCPError):
+            websearch._check_quota("prefix " * 500 + self.NOTICE)
+
+    def test_results_mentioning_rate_limits_pass(self):
+        """Real results talk about rate limits; that is not a throttle."""
+        page = ("### query\nTitle: Exa MCP\nURL: https://exa.ai/docs\n"
+                "Highlights:\nNo API key is needed, at a free rate limit. "
+                "Rate limiting is applied per IP.")
         websearch._check_quota(page)  # must not raise
+
+    def test_empty_result_passes(self):
+        """An empty or 'no results' answer is short, but not a throttle."""
+        for text in ("", "No results found.", "   ", "No results."):
+            websearch._check_quota(text)  # must not raise
