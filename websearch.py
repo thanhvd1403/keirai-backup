@@ -15,6 +15,7 @@ import urllib.parse
 import urllib.request
 
 MCP_URL = "https://mcp.exa.ai/mcp"
+USER_AGENT = "keirai/1.0"  # Cloudflare 1010 blocks the urllib default UA
 PROTOCOL_VERSION = "2025-06-18"
 TIMEOUT = 60
 MAX_QUERIES = 3        # one Exa search call per query, at most this many
@@ -23,6 +24,7 @@ EXCERPT_CHARS = 6000   # web_fetch_exa default is 3000 - keep more context
 FULL_CHARS = 60000     # full_content=true: as much of the page as fits
 # Exa answers a throttled search with plain text content (not isError)
 QUOTA_MARK = "rate limit"
+QUOTA_MAX_CHARS = 600  # a throttle notice is short; real results are long
 
 
 class MCPError(Exception):
@@ -49,6 +51,10 @@ class MCPClient:
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
+            # Cloudflare fronts mcp.exa.ai and answers urllib's default
+            # "Python-urllib/3.x" with Error 1010 (blocked browser signature).
+            # Any honest UA passes; without this every call 403s.
+            "User-Agent": USER_AGENT,
         }
         if session:
             headers["Mcp-Session-Id"] = session
@@ -120,9 +126,16 @@ def call_tool(name, arguments, api_key="", url=MCP_URL, timeout=TIMEOUT):
 
 def _check_quota(text):
     """Exa reports a throttled search as ordinary content, not as an error -
-    raise instead of handing the model a rate-limit notice as 'results'."""
-    if QUOTA_MARK in (text or "").lower():
-        raise MCPError(text.strip())
+    raise instead of handing the model a rate-limit notice as 'results'.
+
+    Only a short message counts: real results run to thousands of chars and
+    routinely *mention* rate limits (any page about APIs does), so a bare
+    substring match turned ordinary answers into errors."""
+    text = (text or "").strip()
+    if len(text) > QUOTA_MAX_CHARS:
+        return
+    if QUOTA_MARK in text.lower():
+        raise MCPError(text)
 
 
 # ---------------------------------------------------------------- tools

@@ -166,3 +166,42 @@ class TestQuotaGuard(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRequestHeaders(unittest.TestCase):
+    def test_sends_user_agent(self):
+        """Cloudflare answers urllib's default UA with HTTP 403 (Error 1010:
+        blocked browser signature), which killed every web_search/web_fetch.
+        The request must carry a UA of its own."""
+        captured = {}
+
+        class FakeResp:
+            headers = {"Content-Type": "application/json"}
+            def read(self): return b'{"jsonrpc":"2.0","id":1,"result":{}}'
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        def fake_urlopen(req, timeout=None):
+            captured["ua"] = req.get_header("User-agent")
+            captured["req"] = req
+            return FakeResp()
+
+        client = websearch.MCPClient()
+        with mock.patch.object(websearch.urllib.request, "urlopen", new=fake_urlopen):
+            client._post({"jsonrpc": "2.0", "id": 1})
+        ua = captured["ua"] or ""
+        self.assertTrue(ua, "no User-Agent header sent")
+        self.assertNotIn("Python-urllib", ua)
+        self.assertEqual(ua, websearch.USER_AGENT)
+
+
+class TestQuotaDetection(unittest.TestCase):
+    def test_short_notice_raises(self):
+        with self.assertRaises(websearch.MCPError):
+            websearch._check_quota("Rate limit exceeded. Add an API key or try again later.")
+
+    def test_long_result_mentioning_rate_limits_passes(self):
+        """Real results talk about rate limits; only a short notice is a throttle."""
+        page = ("### query\nTitle: Exa MCP\n" + "Exa offers a free rate limit. " * 60)
+        self.assertGreater(len(page), websearch.QUOTA_MAX_CHARS)
+        websearch._check_quota(page)  # must not raise
