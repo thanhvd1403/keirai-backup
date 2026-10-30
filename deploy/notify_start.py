@@ -4,9 +4,14 @@ actually answers.
 
 ExecStartPost fires the moment the unit starts - before the process has
 imported anything, before Telegram long-polling is up. A message sent then
-would be lying. So this waits for readiness (unit active, main PID alive,
-Telegram getMe answering) and only then sends. Silent when it cannot
-confirm readiness: an unconfirmed "I'm back" is worse than none.
+would be lying, and "the process exists" / "getMe works" are both lies of
+that kind: the first says nothing about this bot, the second only proves the
+token is valid.
+
+Readiness is therefore taken from the harness itself: main.py touches
+logs/keirai.ready after its first successful getUpdates. This waits for that
+file, freshly written since this start, and only then sends. Silent when it
+cannot confirm: an unconfirmed "I'm back" is worse than none.
 
 Detached (`--detach`, what the unit uses): the helper double-forks, so
 systemd does not wait on a 25s poll and the process is not killed by the
@@ -23,24 +28,21 @@ Usage:
     notify_start.py --send        # send a real "test" message now
 """
 
-import json
 import os
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from notify_stop import BASE, LOGS, read_config, send, stamp  # noqa: E402
 
 UNIT = os.environ.get("UNIT") or "keirai.service"
-READY_TIMEOUT = 25      # seconds to wait for "answering"
+READY_TIMEOUT = 25      # seconds to wait for the harness to report ready
 POLL = 0.4
 COOLDOWN = 60           # seconds: a crash loop announces once, not every 3s
-GETME_TIMEOUT = 10
 MARKER = LOGS / "keirai.started.marker"
+READY = LOGS / "keirai.ready"   # touched by main.py once polling works
 
 
 def _run(args, timeout=10):
@@ -70,27 +72,20 @@ def pid_alive(pid):
     return True
 
 
-def telegram_answers(token):
-    """getMe: the bot loop is alive and its token still works."""
-    if not token:
-        return False
-    url = "https://api.telegram.org/bot%s/getMe" % token
+def ready_since(moment):
+    """True when the harness has written its ready file since `moment`."""
     try:
-        with urllib.request.urlopen(url, timeout=GETME_TIMEOUT) as resp:
-            payload = json.loads(resp.read().decode() or "{}")
-        return bool(payload.get("ok"))
-    except (urllib.error.URLError, OSError, ValueError):
+        return READY.stat().st_mtime >= moment - 1.0
+    except OSError:
         return False
 
 
-def wait_ready(token, timeout=READY_TIMEOUT):
-    """Seconds it took to become ready, or None if it never did."""
-    started = time.monotonic()
-    while time.monotonic() - started < timeout:
-        if _run(["systemctl", "is-active", UNIT]) == "active":
-            pid = main_pid(UNIT)
-            if pid and pid_alive(pid) and telegram_answers(token):
-                return time.monotonic() - started
+def wait_ready(timeout=READY_TIMEOUT):
+    """Seconds it took for the harness to report itself ready, or None."""
+    started = time.time()
+    while time.time() - started < timeout:
+        if _run(["systemctl", "is-active", UNIT]) == "active" and ready_since(started):
+            return time.time() - started
         time.sleep(POLL)
     return None
 
@@ -105,7 +100,7 @@ def build_message(ready_in, pid, head):
     bits = []
     if pid:
         bits.append("pid %d" % pid)
-    bits.append("answering after %.1fs" % ready_in)
+    bits.append("receiving messages after %.1fs" % ready_in)
     if head:
         bits.append(head)
     lines.append(" · ".join(bits))
@@ -154,9 +149,10 @@ def main(argv):
         text = "✅ keirai start-notify test\n" + build_message(ready_in, pid, head).split("\n", 1)[1]
         return _deliver(token, chat, text, dry_run=False, marker=False)
 
-    ready_in = wait_ready(token)
+    ready_in = wait_ready()
     if ready_in is None:
-        stamp("not ready within %ds - no start message" % READY_TIMEOUT)
+        stamp("harness not ready within %ds (no fresh %s) - no start message"
+              % (READY_TIMEOUT, READY.name))
         return 0
 
     text = build_message(ready_in, main_pid(UNIT), head_sha())

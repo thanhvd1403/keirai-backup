@@ -1194,7 +1194,7 @@ class TestStop(unittest.TestCase):
 
         with mock.patch.object(main.time, "sleep", lambda s: None):
             with self.assertRaises(KeyboardInterrupt):
-                main._watch_updates(FakeTG(), self.state, self.q)
+                main._watch_updates(self.cfg, FakeTG(), self.state, self.q)
         self.assertEqual(calls["n"], 3)  # kept polling through both failures
         self.assertTrue(self.q.empty())
 
@@ -1221,7 +1221,7 @@ class TestStop(unittest.TestCase):
         with mock.patch.object(main, "_route_update", side_effect=flaky):
             with mock.patch.object(main.time, "sleep", lambda s: None):
                 with self.assertRaises(KeyboardInterrupt):
-                    main._watch_updates(FakeTG(), self.state, self.q)
+                    main._watch_updates(self.cfg, FakeTG(), self.state, self.q)
         self.assertEqual(seen_offsets[:2], [None, 2])  # offset advanced past #1
         self.assertEqual(self.q.qsize(), 1)        # #2 was routed normally
 
@@ -3000,11 +3000,14 @@ class TestRestartCommand(unittest.TestCase):
         self.cfg = make_config()
         disable_titles(self)
 
-    def test_restart_in_main_chat_schedules(self):
+    def test_restart_in_main_chat_is_silent(self):
+        """No "restarting..." reply: the start notifier is the confirmation
+        that the restart actually took, and it only speaks once the poll loop
+        is live."""
         with mock.patch.object(main, "_schedule_restart") as sched:
             main.handle_message(self.cfg, self.tg, msg(text="/restart"), self.state)
         self.assertEqual(sched.call_count, 1)
-        self.assertIn("restarting now", self.tg.sent[-1][1])
+        self.assertEqual(self.tg.sent, [])
 
     def test_restart_refused_inside_a_topic(self):
         self.cfg.topic_flow = True  # else the topic message is ignored outright

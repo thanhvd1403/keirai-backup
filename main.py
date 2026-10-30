@@ -962,7 +962,10 @@ def cmd_restart(cfg, tg, msg, thread_id, state):
         tg.send(chat_id, "restart failed: <code>%s</code>" % html.escape(str(e)[:300]),
                 thread_id)
         return
-    tg.send(chat_id, "restarting now - I'll message you when I'm back", thread_id)
+    # No acknowledgement: the start notifier says "I'm back" only once the
+    # poll loop is live, and that is the one message worth sending. A reply
+    # here would confirm the command was typed, not that the restart worked.
+    log.info("restart requested from chat=%s thread=%s", chat_id, thread_id)
 
 
 @command("compact", "summarize older context now to free space (also runs automatically)")
@@ -2592,7 +2595,24 @@ def _route_update(state, out_q, upd):
     return False
 
 
-def _watch_updates(tg, state, out_q):
+def _mark_ready(cfg):
+    """Write logs/keirai.ready once polling actually works.
+
+    deploy/notify_start.py waits for this file before saying "I'm back".
+    A spawned process proves nothing, and Telegram answering getMe proves
+    only that the *token* is good - not that this bot is consuming updates.
+    The first successful getUpdates is the earliest honest "I am back", and
+    it is the harness saying so about itself."""
+    path = os.path.join(config_mod.base_dir(cfg), "logs", "keirai.ready")
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("%d\n" % os.getpid())
+    except OSError as e:
+        log.warning("cannot write ready file %s: %s", path, e)
+
+
+def _watch_updates(cfg, tg, state, out_q):
     """Long-poll getUpdates forever. Sole owner of the offset.
 
     This thread dying = the bot goes silent forever (everything else runs
@@ -2601,10 +2621,14 @@ def _watch_updates(tg, state, out_q):
     unexpected bug could throw is caught, logged and retried here."""
     offset = None
     backoff = 1
+    ready = False
     while True:
         try:
             updates = tg.get_updates(offset)
             backoff = 1
+            if not ready:
+                _mark_ready(cfg)  # first honest "I can receive messages"
+                ready = True
         except tg_mod.TelegramError as e:
             log.error("poll error: %s", e)
             time.sleep(backoff)
@@ -2743,7 +2767,7 @@ def main():
         log.warning("setMyCommands failed: %s", e)
     log.info("polling... (default model: %s)", cfg.default_model)
     out_q = queue.Queue()
-    threading.Thread(target=_watch_updates, args=(tg, state, out_q),
+    threading.Thread(target=_watch_updates, args=(cfg, tg, state, out_q),
                      daemon=True, name="updates").start()
     workers = {}  # session key -> queue; a worker thread per active session
     while True:
