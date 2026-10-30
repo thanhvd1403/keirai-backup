@@ -74,16 +74,18 @@ class Telegram:
     def get_me(self):
         return self.call("getMe")
 
-    def get_updates(self, offset=None):
+    def get_updates(self, offset=None, timeout=POLL_TIMEOUT):
+        """Long poll. timeout=0 makes it a plain fetch-and-return - used once
+        at startup so readiness is not delayed by the idle wait."""
         payload = {
-            "timeout": POLL_TIMEOUT,
+            "timeout": timeout,
             # stopped_message_generation = the user pressed the native Stop
             # button Telegram shows under a streamed draft (can_stop)
             "allowed_updates": ["message", "stopped_message_generation"],
         }
         if offset is not None:
             payload["offset"] = offset
-        return self.call("getUpdates", payload, timeout=POLL_TIMEOUT + 15)
+        return self.call("getUpdates", payload, timeout=timeout + 15)
 
     # ------------------------------------------------------------ sending
 

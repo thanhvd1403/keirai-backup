@@ -189,3 +189,19 @@ class TestNotModified(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPollTimeout(unittest.TestCase):
+    def test_default_is_a_long_poll(self):
+        tg = telegram.Telegram("tok")
+        with mock.patch.object(tg, "call", return_value=[]) as call:
+            tg.get_updates(None)
+        self.assertEqual(call.call_args[0][1]["timeout"], telegram.POLL_TIMEOUT)
+
+    def test_zero_makes_it_non_blocking(self):
+        """Startup readiness must not wait for the idle timeout to expire."""
+        tg = telegram.Telegram("tok")
+        with mock.patch.object(tg, "call", return_value=[]) as call:
+            tg.get_updates(None, timeout=0)
+        self.assertEqual(call.call_args[0][1]["timeout"], 0)
+        self.assertEqual(call.call_args[1]["timeout"], 15)  # 0 + 15 socket slack

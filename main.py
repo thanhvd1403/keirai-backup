@@ -925,6 +925,38 @@ def cmd_stop(cfg, tg, msg, thread_id, state):
 
 SERVICE_UNIT = "keirai.service"  # the unit this process runs under
 IMPORT_CHECK_TIMEOUT = 30  # seconds before a hanging import counts as broken
+RESTART_DEBOUNCE = 30  # seconds: a second /restart inside this window is a no-op
+
+
+def _restart_mark(base_dir):
+    return os.path.join(base_dir, "logs", "keirai.restart.pending")
+
+
+def _restart_pending(base_dir):
+    """A restart was requested very recently (possibly by the run that is
+    about to die). Overlapping restarts queue one transient unit each and
+    fight: each boot kills the one before it and none of them ever becomes
+    ready, so nobody is told anything."""
+    try:
+        return (time.time() - os.path.getmtime(_restart_mark(base_dir))) < RESTART_DEBOUNCE
+    except OSError:
+        return False
+
+
+def _mark_restart_requested(base_dir):
+    """Stamp the request and drop the start-notify marker, so this deliberate
+    restart always announces itself - the 60s cooldown exists for crash loops,
+    not for a restart a human just asked for."""
+    try:
+        logs = os.path.join(base_dir, "logs")
+        os.makedirs(logs, exist_ok=True)
+        open(_restart_mark(base_dir), "w").close()
+        try:
+            os.remove(os.path.join(logs, "keirai.started.marker"))
+        except OSError:
+            pass
+    except OSError as e:
+        log.warning("cannot stamp restart marker: %s", e)
 
 
 def _code_imports(base_dir):
@@ -978,17 +1010,26 @@ def cmd_restart(cfg, tg, msg, thread_id, state):
         tg.send(chat_id, "restart only works in the main chat - run it in "
                 "All messages", thread_id)
         return
-    ok, err = _code_imports(config_mod.base_dir(cfg))
+    base = config_mod.base_dir(cfg)
+    if _restart_pending(base):
+        tg.send(chat_id, "a restart is already in progress", thread_id)
+        return
+    ok, err = _code_imports(base)
     if not ok:
         log.warning("restart refused, code does not import: %s", err[-200:])
         tg.send(chat_id, "not restarting - the code on disk does not import, "
                 "and I would not come back:\n<pre>%s</pre>" % html.escape(err),
                 thread_id)
         return
+    _mark_restart_requested(base)
     try:
         _schedule_restart()
     except Exception as e:  # noqa: BLE001 - reported, never raised at Telegram
         log.warning("restart scheduling failed: %s", e)
+        try:
+            os.remove(_restart_mark(base))  # do not block the next attempt
+        except OSError:
+            pass
         tg.send(chat_id, "restart failed: <code>%s</code>" % html.escape(str(e)[:300]),
                 thread_id)
         return
@@ -2654,7 +2695,11 @@ def _watch_updates(cfg, tg, state, out_q):
     ready = False
     while True:
         try:
-            updates = tg.get_updates(offset)
+            # the very first poll is non-blocking: a long poll returns only
+            # when a message arrives OR the idle timeout fires (25s), so
+            # gating readiness on it made "up" as slow as the idle wait.
+            updates = tg.get_updates(offset, timeout=0 if not ready
+                                     else tg_mod.POLL_TIMEOUT)
             backoff = 1
             if not ready:
                 _mark_ready(cfg)  # first honest "I can receive messages"

@@ -1184,7 +1184,8 @@ class TestStop(unittest.TestCase):
         calls = {"n": 0}
 
         class FakeTG:
-            def get_updates(self, offset=None):
+            def get_updates(self, offset=None, timeout=25):
+                calls.setdefault("timeouts", []).append(timeout)
                 calls["n"] += 1
                 if calls["n"] == 1:
                     raise ValueError("malformed update")     # unexpected bug
@@ -1196,6 +1197,7 @@ class TestStop(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 main._watch_updates(self.cfg, FakeTG(), self.state, self.q)
         self.assertEqual(calls["n"], 3)  # kept polling through both failures
+        self.assertEqual(calls["timeouts"][0], 0)  # startup probe is non-blocking
         self.assertTrue(self.q.empty())
 
     def test_one_bad_update_does_not_wedge_polling(self):
@@ -1205,7 +1207,7 @@ class TestStop(unittest.TestCase):
         seen_offsets = []
 
         class FakeTG:
-            def get_updates(self, offset=None):
+            def get_updates(self, offset=None, timeout=25):
                 seen_offsets.append(offset)
                 if pending:
                     return [pending.pop(0)]
@@ -3004,7 +3006,9 @@ class TestRestartCommand(unittest.TestCase):
         """No "restarting..." reply: the start notifier is the confirmation
         that the restart actually took, and it only speaks once the poll loop
         is live."""
-        with mock.patch.object(main, "_code_imports", return_value=(True, "")), \
+        with mock.patch.object(main, "_restart_pending", return_value=False), \
+             mock.patch.object(main, "_mark_restart_requested"), \
+             mock.patch.object(main, "_code_imports", return_value=(True, "")), \
              mock.patch.object(main, "_schedule_restart") as sched:
             main.handle_message(self.cfg, self.tg, msg(text="/restart"), self.state)
         self.assertEqual(sched.call_count, 1)
@@ -3014,12 +3018,49 @@ class TestRestartCommand(unittest.TestCase):
         """A restart into broken code leaves no bot to send /restart again:
         the guard must keep the RUNNING one alive and say why."""
         boom = "Traceback (most recent call last):\nSyntaxError: invalid syntax"
-        with mock.patch.object(main, "_code_imports", return_value=(False, boom)), \
+        with mock.patch.object(main, "_restart_pending", return_value=False), \
+             mock.patch.object(main, "_code_imports", return_value=(False, boom)), \
              mock.patch.object(main, "_schedule_restart") as sched:
             main.handle_message(self.cfg, self.tg, msg(text="/restart"), self.state)
         self.assertEqual(sched.call_count, 0)          # never scheduled
         self.assertIn("does not import", self.tg.sent[-1][1])
         self.assertIn("SyntaxError", self.tg.sent[-1][1])
+
+
+    def test_concurrent_restart_is_debounced(self):
+        """Two /restart in quick succession queue two transient units; each
+        boot kills the one before it and nothing ever becomes ready, so the
+        user hears nothing at all. The second one says so instead."""
+        with mock.patch.object(main, "_restart_pending", return_value=True), \
+             mock.patch.object(main, "_code_imports") as guard, \
+             mock.patch.object(main, "_schedule_restart") as sched:
+            main.handle_message(self.cfg, self.tg, msg(text="/restart"), self.state)
+        self.assertEqual(sched.call_count, 0)
+        guard.assert_not_called()          # no 120ms import check either
+        self.assertIn("already in progress", self.tg.sent[-1][1])
+
+    def test_restart_clears_the_start_cooldown(self):
+        """A deliberate restart must announce itself even if a crash
+        announced < 60s ago."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            logs = os.path.join(d, "logs")
+            os.makedirs(logs)
+            marker = os.path.join(logs, "keirai.started.marker")
+            open(marker, "w").close()
+            main._mark_restart_requested(d)
+            self.assertFalse(os.path.exists(marker))                  # cleared
+            self.assertTrue(os.path.exists(main._restart_mark(d)))    # stamped
+            self.assertTrue(main._restart_pending(d))
+
+    def test_stale_restart_mark_is_not_pending(self):
+        import tempfile, time as _t
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "logs"))
+            main._mark_restart_requested(d)
+            old = _t.time() - (main.RESTART_DEBOUNCE + 5)
+            os.utime(main._restart_mark(d), (old, old))
+            self.assertFalse(main._restart_pending(d))
 
     def test_import_guard_catches_a_broken_tree(self):
         """Real check, real subprocess: a package that fails to import."""
@@ -3051,7 +3092,10 @@ class TestRestartCommand(unittest.TestCase):
         self.assertIn("main chat", self.tg.sent[-1][1])
 
     def test_restart_reports_scheduling_failure(self):
-        with mock.patch.object(main, "_schedule_restart",
+        with mock.patch.object(main, "_restart_pending", return_value=False), \
+             mock.patch.object(main, "_mark_restart_requested"), \
+             mock.patch.object(main, "_code_imports", return_value=(True, "")), \
+             mock.patch.object(main, "_schedule_restart",
                                side_effect=RuntimeError("sudo: a password is required")):
             main.handle_message(self.cfg, self.tg, msg(text="/restart"), self.state)
         self.assertIn("restart failed", self.tg.sent[-1][1])
