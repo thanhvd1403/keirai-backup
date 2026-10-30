@@ -28,6 +28,7 @@ Usage:
     notify_start.py --send        # send a real "test" message now
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -36,6 +37,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from notify_stop import BASE, LOGS, read_config, send, stamp  # noqa: E402
+from notify_stop import LASTSTOP, QUIET  # noqa: E402
 
 UNIT = os.environ.get("UNIT") or "keirai.service"
 READY_TIMEOUT = 25      # seconds to wait for the harness to report ready
@@ -107,6 +109,18 @@ def build_message(ready_in, pid, head):
     return "\n".join(lines)
 
 
+def last_stop_was_clean():
+    """True when the previous run was stopped on purpose (systemctl restart,
+    a clean exit). Such a start is a deliberate restart and must always be
+    announced - the cooldown exists for crash loops, and a manual restart was
+    being swallowed by it."""
+    try:
+        data = json.loads(LASTSTOP.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return True   # no history: assume a real start, not a loop
+    return data.get("result") in QUIET
+
+
 def recently_announced():
     try:
         return (time.time() - MARKER.stat().st_mtime) < COOLDOWN
@@ -166,7 +180,7 @@ def _deliver(token, chat, text, dry_run, marker):
     if dry_run:
         print(text)
         return 0
-    if marker and recently_announced():
+    if marker and recently_announced() and not last_stop_was_clean():
         stamp("start message suppressed (announced < %ds ago)" % COOLDOWN)
         return 0
     if not token or chat is None:

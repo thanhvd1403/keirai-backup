@@ -3112,3 +3112,20 @@ class TestRestartCommand(unittest.TestCase):
         self.assertTrue(any(a.startswith("--on-active=") for a in argv))
         self.assertIn("restart", argv)
         self.assertIn(main.SERVICE_UNIT, argv)
+
+
+class TestHelpRendering(unittest.TestCase):
+    def test_descriptions_are_html_escaped(self):
+        """The help body is HTML, but a description is prose. An unescaped
+        "<provider/model-id>" made Telegram reject the whole message with
+        HTTP 400 ("Unsupported start tag") - /help and /start died silently."""
+        import html as _html
+        body = main.build_help()
+        for name, (fn, desc, hidden) in main.COMMANDS.items():
+            if hidden or "<" not in desc:
+                continue
+            self.assertIn(_html.escape(desc), body, "description of /%s is not escaped" % name)
+        # and no stray tag-shaped prose survives: every <...> is an allowed tag
+        import re
+        bad = re.findall(r"<(?!/?(?:b|i|u|s|code|pre|a|tg-spoiler)\b)[^>]{0,40}>", body)
+        self.assertEqual(bad, [])

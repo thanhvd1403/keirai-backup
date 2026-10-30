@@ -30,6 +30,7 @@ BASE = Path(__file__).resolve().parent.parent          # repo root (one up from 
 CONFIG = Path(os.environ.get("KEIRAI_CONFIG") or BASE / "config.toml")
 LOGS = BASE / "logs"
 MARKER = LOGS / "keirai.notify.marker"
+LASTSTOP = LOGS / "keirai.laststop.json"   # how the previous run ended
 LOG = LOGS / "keirai.notify.log"
 
 COOLDOWN = 1800        # seconds: repeat deaths within this window go to the log only
@@ -146,6 +147,18 @@ def build_message(result, uptime, unit):
     return "\n".join(lines)
 
 
+def record_result(result, uptime):
+    """Remember how this run ended. notify_start reads it: a clean stop means
+    the next start was a deliberate restart (announce it), while a crash
+    means it may be a loop (rate-limit it)."""
+    try:
+        LOGS.mkdir(parents=True, exist_ok=True)
+        LASTSTOP.write_text(json.dumps({"result": result, "uptime": uptime,
+                                        "at": time.time()}), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def recently_notified():
     try:
         age = time.time() - MARKER.stat().st_mtime
@@ -179,6 +192,9 @@ def main(argv):
         unit = os.environ.get("UNIT") or "keirai.service"
         uptime = uptime_seconds(unit)
         text = build_message(result, uptime, unit)
+
+    if not dry_run:  # a dry run must not rewrite how the last real stop ended
+        record_result(result, uptime)
 
     if text is None:
         stamp("quiet stop (result=%s) - no message" % result)

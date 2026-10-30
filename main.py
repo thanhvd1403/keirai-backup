@@ -319,7 +319,10 @@ def build_help():
     for name in sorted(COMMANDS):
         fn, desc, hidden = COMMANDS[name]
         if not hidden:
-            lines.append("/%s - %s" % (name, desc))
+            # the body is HTML, but a description is prose: "<provider/model-id>"
+            # is not a tag, and Telegram rejects the whole message (HTTP 400
+            # "Unsupported start tag") - which killed /help and /start silently
+            lines.append("/%s - %s" % (name, html.escape(desc)))
     lines += [
         "",
         "Sessions live in the plain main chat by default. Run /topic to enter "
@@ -434,7 +437,7 @@ def cmd_models(cfg, tg, msg, thread_id, state):
         tg.send(msg["chat"]["id"], part, thread_id)
 
 
-@command("model", "switch model: /model provider/model-id, or /model global <provider/model-id>")
+@command("model", "switch model: /model provider/model-id, or /model global provider/model-id")
 def cmd_model(cfg, tg, msg, thread_id, state):
     arg = _arg(msg).strip()
     chat_id = msg["chat"]["id"]

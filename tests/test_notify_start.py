@@ -70,9 +70,46 @@ class TestDelivery(unittest.TestCase):
         with mock.patch.object(notify_start, "wait_ready", return_value=0.5), \
              mock.patch.object(notify_start, "read_config", return_value=("tok", 1)), \
              mock.patch.object(notify_start, "recently_announced", return_value=True), \
+             mock.patch.object(notify_start, "last_stop_was_clean", return_value=False), \
              mock.patch.object(notify_start, "send") as send:
             notify_start.main([])
         send.assert_not_called()
+
+    def test_manual_restart_always_announces(self):
+        """A clean stop means "systemctl restart": the 60s cooldown exists for
+        crash loops and must not swallow a restart somebody asked for."""
+        with mock.patch.object(notify_start, "wait_ready", return_value=0.5), \
+             mock.patch.object(notify_start, "read_config", return_value=("tok", 1)), \
+             mock.patch.object(notify_start, "recently_announced", return_value=True), \
+             mock.patch.object(notify_start, "last_stop_was_clean", return_value=True), \
+             mock.patch.object(notify_start, "touch_marker"), \
+             mock.patch.object(notify_start, "send", return_value=True) as send:
+            notify_start.main([])
+        send.assert_called_once()
+
+
+class TestStopState(unittest.TestCase):
+    def _with_state(self, payload):
+        import tempfile, json as _j
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        path = Path(d.name) / "laststop.json"
+        path.write_text(_j.dumps(payload), encoding="utf-8")
+        return mock.patch.object(notify_start, "LASTSTOP", path)
+
+    def test_clean_stop(self):
+        with self._with_state({"result": "success"}):
+            self.assertTrue(notify_start.last_stop_was_clean())
+
+    def test_crash_is_not_clean(self):
+        for result in ("exit-code", "signal", "oom-kill", "core-dump"):
+            with self._with_state({"result": result}):
+                self.assertFalse(notify_start.last_stop_was_clean(),
+                                 "result=%s should not count as clean" % result)
+
+    def test_missing_state_assumes_real_start(self):
+        with mock.patch.object(notify_start, "LASTSTOP", Path("/tmp/nope-laststop.json")):
+            self.assertTrue(notify_start.last_stop_was_clean())
 
     def test_no_config_is_not_an_error(self):
         with mock.patch.object(notify_start, "wait_ready", return_value=0.5), \
