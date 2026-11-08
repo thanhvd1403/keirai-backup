@@ -166,6 +166,27 @@ class TestBash(unittest.TestCase):
         out = tools.execute(self.cfg, "bash", {"command": "shutdown now"})
         self.assertIn("blocked", out)
 
+    def test_deny_self_restart(self):
+        """Restarting the unit from inside a turn kills the turn - and the
+        answer with it (happened for real at 00:06:44: reply never sent)."""
+        for cmd in (
+                "sudo -n systemctl restart keirai",
+                "sudo systemctl restart keirai.service",
+                "systemctl stop keirai",
+                "sudo -n systemd-run --on-active=1 --unit=k systemctl restart keirai",
+                "service keirai restart",
+                "pkill -f 'python3 main.py'"):
+            out = tools.execute(self.cfg, "bash", {"command": cmd})
+            self.assertIn("blocked: this would restart keirai", out, cmd)
+            self.assertIn("/restart", out, cmd)
+
+    def test_self_restart_guard_is_narrow(self):
+        """Reading about the unit, or restarting something else, still works."""
+        for cmd in ("systemctl status keirai", "journalctl -u keirai -n 5",
+                    "systemctl restart nginx", "echo restart keirai > /tmp/x",
+                    "grep -n 'systemctl restart' deploy/idle_restart.sh"):
+            self.assertFalse(tools._self_restart(cmd), cmd)
+
     def test_timeout(self):
         out = tools.execute(self.cfg, "bash", {
             "command": "%s -c \"import time; time.sleep(10)\"" % PY,

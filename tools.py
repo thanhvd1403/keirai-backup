@@ -44,6 +44,32 @@ class ToolError(Exception):
     pass
 
 
+# A command that restarts/stops the agent's own unit kills the process running
+# this tool call - and the reply with it. Measured 2026-11-08 00:06:44: a turn
+# ran `sudo -n systemctl restart keirai` at tool round 22, the service stopped
+# 2s later, and the finished answer (22 rounds of work) was never sent. The
+# /restart command exists for this: it acks first, detaches through
+# `systemd-run --on-active=1`, and only then stops the unit.
+SELF_RESTART_RE = re.compile(
+    r"\b(?:systemctl|service|systemd-run)\b[^;&|\n]*"
+    r"\b(?:restart|stop|try-restart|reload|kill|start)\b[^;&|\n]*\bkeirai\b"
+    r"|\bservice\s+keirai[^;&|\n]*\b(?:restart|stop|reload|start)\b",
+    re.IGNORECASE)
+SELF_KILL_RE = re.compile(r"\bpkill\b[^;&|\n]*\b(?:main\.py|keirai)\b", re.IGNORECASE)
+SELF_RESTART_MSG = (
+    "blocked: this would restart keirai from inside a turn, killing the process "
+    "that is running this command - and the answer with it (that is what "
+    "happened at 00:06:44 today: 22 tool rounds of work, reply never sent). "
+    "Send the /restart command instead: it acknowledges first, detaches through "
+    "`systemd-run --on-active=1`, and the reply survives. To load a code change "
+    "without leaving Telegram, finish the turn with /restart as your last line.")
+
+
+def _self_restart(cmd):
+    """True if `cmd` would stop/restart the agent's own systemd unit."""
+    return bool(SELF_RESTART_RE.search(cmd) or SELF_KILL_RE.search(cmd))
+
+
 # ---------------------------------------------------------------- specs
 
 def _fn(name, desc, props, required):
@@ -335,6 +361,8 @@ def _bash(cfg, args, ctx):
     if denied:
         return ("command blocked by safety blacklist (pattern: %s). "
                 "Find a non-destructive alternative." % denied)
+    if _self_restart(command):
+        return SELF_RESTART_MSG
     timeout = int(args.get("timeout_seconds") or getattr(cfg, "bash_timeout", 30))
     timeout = max(1, min(timeout, 300))
     interrupt = ctx.get("interrupt") if isinstance(ctx, dict) else None
