@@ -283,11 +283,17 @@ class TestSessions(unittest.TestCase):
             user_texts = [m["content"] for m in call[0][3]
                           if m.get("role") == "user"]
             self.assertEqual(user_texts, [own])
-        # one anonymized app-wide x-opencode-session; distinct session ids
-        sids = {call[1]["session_id"] for call in chat_mock.call_args_list}
-        self.assertEqual(sids, {main.SESSION_ID})
-        self.assertNotEqual(self.state.meta[(100, t1)]["session_id"],
-                            self.state.meta[(100, t2)]["session_id"])
+        # each session sends its OWN hashed x-opencode-session (Go/Zen want a
+        # stable id per conversation) - never one shared app-wide bucket
+        sid1 = self.state.meta[(100, t1)]["session_id"]
+        sid2 = self.state.meta[(100, t2)]["session_id"]
+        self.assertNotEqual(sid1, sid2)
+        sids = [call[1]["session_id"] for call in chat_mock.call_args_list]
+        self.assertEqual(sids, [main._session_header(sid1),
+                                main._session_header(sid2)])
+        for sent, own in zip(sids, (sid1, sid2)):
+            self.assertNotIn(own, sent)      # hashed: raw id never leaves
+            self.assertEqual(sent, main._session_header(own))
 
     @mock.patch.object(providers, "chat")
     def test_manual_topic_rejected_until_bound(self, chat_mock):
@@ -3129,3 +3135,25 @@ class TestHelpRendering(unittest.TestCase):
         import re
         bad = re.findall(r"<(?!/?(?:b|i|u|s|code|pre|a|tg-spoiler)\b)[^>]{0,40}>", body)
         self.assertEqual(bad, [])
+
+class TestSessionHeader(unittest.TestCase):
+    """x-opencode-session: one stable, hashed id per keirai session."""
+
+    def test_stable_per_session(self):
+        h = main._session_header("20261108-0003-ab12")
+        self.assertEqual(h, main._session_header("20261108-0003-ab12"))
+        self.assertEqual(len(h), 32)
+        self.assertTrue(all(c in "0123456789abcdef" for c in h))
+
+    def test_distinct_across_sessions(self):
+        ids = ["20261108-0003-ab12", "20261108-0003-ab13", "20261108-0004-ab12"]
+        self.assertEqual(len({main._session_header(i) for i in ids}), 3)
+        # ... and it is not the old app-wide constant that merged every
+        # conversation into a single routing/cache bucket
+        self.assertNotIn("keirai", {main._session_header(i) for i in ids})
+
+    def test_raw_id_never_leaks(self):
+        for raw in ("20261108-0003-ab12", "", None):
+            out = main._session_header(raw)
+            self.assertNotIn("20261108", out)
+            self.assertRegex(out, r"^[0-9a-f]{32}$")

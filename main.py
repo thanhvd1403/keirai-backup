@@ -3,6 +3,7 @@
 Stdlib only. Run: python main.py  (config from ./config.toml or KEIRAI_CONFIG)
 """
 import base64
+import hashlib
 import html
 import json
 import logging
@@ -35,7 +36,6 @@ CALL_ARG_CHARS = 500  # tool-call arguments kept per call in a compaction summar
 CALL_BLOCK_CHARS = 2000  # ... and for all of one message's calls together
 REASONING_KEEP_CHARS = 4000  # reasoning kept per assistant message in context
                              # (tail only - conclusions live at the end)
-SESSION_ID = "keirai"  # anonymized x-opencode-session for the whole app (no chat ids)
 TITLE_WAIT = 10  # seconds the rename may take before the reply starts (derived
                  # title past that - the rename itself always happens first)
 SLOT_NONE = object()  # sid_slot(): not found (None means the main-chat slot)
@@ -45,6 +45,19 @@ TEXT_EXTS = {
     ".go", ".java", ".rb", ".xml", ".html", ".css", ".sql", ".log", ".csv",
 }
 IMAGE_MIMES = ("image/jpeg", "image/png", "image/gif", "image/webp")
+
+
+def _session_header(session_id):
+    """x-opencode-session value for ONE keirai session.
+
+    Go/Zen ask for a stable session id *per conversation* ("so we can
+    optimize routing and prompt caching") and pin both to it. One app-wide
+    id put every conversation in the same bucket; this derives a distinct
+    id per keirai session, stable for its whole life. Hashed so the raw id
+    (creation timestamp + entropy) never leaves the machine.
+    """
+    return hashlib.sha256(
+        ("keirai:%s" % (session_id or "")).encode("utf-8")).hexdigest()[:32]
 
 
 class State:
@@ -1054,12 +1067,14 @@ def cmd_compact(cfg, tg, msg, thread_id, state):
     if not api_key:
         _err(tg, msg, thread_id, "no API key for provider '%s'" % provider)
         return
+    meta = state.ensure_meta(chat_id, thread_id)
     tg.typing(chat_id, thread_id)
     before_n, before_tok = len(history), _history_tokens(history, cfg)
     cusage = {}
     try:
         history[:] = _compact(cfg, provider, api_key, model_id, history,
-                              SESSION_ID, usage_out=cusage)
+                              _session_header(meta.get("session_id")),
+                              usage_out=cusage)
         _strip_orphan_tools(history)
     except Exception as e:
         _err(tg, msg, thread_id, "compaction failed: %s" % e)
@@ -1429,7 +1444,8 @@ def _maybe_name_session(cfg, tg, state, chat_id, thread_id, msg, images):
         try:
             out, _r, _t = providers.chat_title(
                 provider, api_key, model_id, messages,
-                session_id=SESSION_ID, usage_out=handle["usage"])
+                session_id=_session_header(meta.get("session_id")),
+                usage_out=handle["usage"])
             handle["result"][0] = out
         except Exception as e:
             log.warning("session naming failed: %s", e)
@@ -1980,7 +1996,10 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
         _err(tg, msg, thread_id, "no API key for provider '%s' (or fallback 'go'/'zen')"
              % provider_name)
         return
-    session_id = SESSION_ID  # anonymized app-wide constant (no chat ids)
+    # one hashed id per keirai session: provider routing and the prompt
+    # cache pin to it, and a new session must not reuse another's bucket
+    session_id = _session_header(
+        state.ensure_meta(chat_id, thread_id).get("session_id"))
     switched = {"on": False}
 
     def pcall(messages, tools=None):
@@ -2061,8 +2080,8 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
     # text, which cannot distinguish a real call from markup the model merely
     # quoted while describing a format
     declared = {s.get("function", {}).get("name") for s in (tool_specs or [])}
-    # session_id stays the anonymized app-wide constant (provider header);
-    # spill_session is this session's own id -> spill files land in
+    # session_id is the hashed per-session provider header (see
+    # _session_header); spill_session is this session's own id -> spill files land in
     # sessions/<session-id>/tool_output/
     ctx = {"session_id": session_id, "interrupt": stop,
            "spill_session": state.ensure_meta(chat_id, thread_id).get("session_id")}
