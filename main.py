@@ -2307,6 +2307,7 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
                                  "content": result})
                 history.append({"role": "tool", "tool_call_id": t["id"],
                                 "content": result})
+                state.persist(chat_id, thread_id)
                 continue
             preview = tools_mod.preview(t["name"], t["arguments"])
             try:
@@ -2333,6 +2334,10 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
                 stored = result
             history.append({"role": "tool", "tool_call_id": t["id"],
                             "content": stored})
+            # write through at every tool boundary: a 56-round run lives in
+            # RAM otherwise, and a crash 20 minutes in takes the whole turn
+            # with it (that is what the docstring always promised)
+            state.persist(chat_id, thread_id)
             log.info("tool %s -> %d chars%s", t["name"], len(result),
                      ", spilled" if spill else "")
             if stop():

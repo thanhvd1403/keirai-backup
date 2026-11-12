@@ -1774,6 +1774,50 @@ class TestToolLoop(unittest.TestCase):
         self.assertEqual(self.tg.rich, [])
         self.assertEqual(self.tg.sent, [])
 
+    def test_tool_results_reach_disk_before_the_turn_ends(self):
+        """Durability: a 56-round run must not live only in RAM. Every tool
+        result is written through at the tool boundary, so a crash mid-turn
+        keeps everything up to the last finished call."""
+        fd, db = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.addCleanup(os.unlink, db)
+        import sessions
+        state = main.State(True, sessions.Store(db))
+        seen = {}
+
+        def fake_exec(cfg, name, args, ctx):
+            if args.get("path") == "b":  # second call of the same round
+                conn = __import__("sqlite3").connect(db)
+                row = conn.execute(
+                    "SELECT messages FROM sessions WHERE chat_id=100 AND thread_id=0"
+                ).fetchone()
+                conn.close()
+                seen["mid"] = json.loads(row[0]) if row else []
+            return "result for %s" % args.get("path")
+
+        with mock.patch.object(main, "_maybe_name_session", lambda *a, **k: None), \
+                mock.patch.object(main.tools_mod, "execute", fake_exec), \
+                mock.patch.object(providers, "chat", side_effect=[
+                    ("", "", [{"id": "c1", "name": "read_file",
+                               "arguments": {"path": "a"}},
+                              {"id": "c2", "name": "read_file",
+                               "arguments": {"path": "b"}}]),
+                    ("all done", "", None)]):
+            main.handle_message(self.cfg, self.tg, msg(text="go"), state)
+        mid = seen.get("mid") or []
+        self.assertTrue(mid, "nothing was persisted while the turn ran")
+        contents = [m.get("content") for m in mid]
+        self.assertIn("go", contents)                  # the user's message
+        self.assertIn("result for a", contents)        # the first tool result
+        self.assertFalse([c for c in contents if c == "result for b"])
+        # and the finished turn is on disk too
+        conn = __import__("sqlite3").connect(db)
+        final = json.loads(conn.execute(
+            "SELECT messages FROM sessions WHERE chat_id=100 AND thread_id=0"
+        ).fetchone()[0])
+        conn.close()
+        self.assertEqual(final[-1]["content"], "all done")
+
     def test_tool_heartbeat_says_still_running_then_finished(self):
         """A slow tool must look alive: one message at the first minute, an
         edit every minute after, finalized with its duration."""
