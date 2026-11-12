@@ -218,8 +218,10 @@ class TestRouter(unittest.TestCase):
         m = msg(text=None, photo=[{"file_id": "f1", "file_size": 100}])
         main.handle_message(self.cfg, self.tg, m, self.state)
         sent = chat_mock.call_args[0][3]  # messages arg
-        self.assertEqual(sent[-1]["content"][1]["type"], "image_url")
-        self.assertTrue(sent[-1]["content"][1]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
+        pic = [m for m in sent if isinstance(m.get("content"), list)][-1]
+        self.assertEqual(pic["content"][1]["type"], "image_url")
+        self.assertTrue(pic["content"][1]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
+        self.assertIn("[time]", sent[-1]["content"])  # clock is the tail
 
     @mock.patch.object(providers, "chat", return_value=("ok", "", None))
     def test_media_test_echo(self, _):
@@ -286,7 +288,8 @@ class TestSessions(unittest.TestCase):
         for call, own in zip(chat_mock.call_args_list,
                              ("about apples", "about bolts")):
             user_texts = [m["content"] for m in call[0][3]
-                          if m.get("role") == "user"]
+                          if m.get("role") == "user"
+                          and "[time]" not in str(m.get("content"))]
             self.assertEqual(user_texts, [own])
         # each session sends its OWN hashed x-opencode-session (Go/Zen want a
         # stable id per conversation) - never one shared app-wide bucket
@@ -1893,9 +1896,11 @@ class TestToolLoop(unittest.TestCase):
         main.handle_message(self.cfg, self.tg, msg(text="hi"), state)
         sent = chat_mock.call_args[0][3]  # messages arg
         # system prompt + all 40 stored messages + the new user message
-        self.assertEqual(len(sent), 40 + 1 + 1)
+        # + the [time] clock that trails every request
+        self.assertEqual(len(sent), 40 + 1 + 1 + 1)
         self.assertEqual(sent[1]["content"], "m0")   # the OLDEST message rides
-        self.assertEqual(sent[-1]["content"], "hi")
+        self.assertEqual(sent[-2]["content"], "hi")
+        self.assertIn("[time]", sent[-1]["content"])
         self.assertEqual(len(hist), 42)              # 40 + user + the answer
 
     def test_images_stay_in_the_prompt_for_the_newest_only(self):
@@ -3064,7 +3069,12 @@ class TestConfigPersistence(unittest.TestCase):
 class TestSystemPromptAndClock(unittest.TestCase):
     """SYSTEM.md as the system prompt (live per request) and the [time] block
     that tells the model the current time plus when this session's agent last
-    worked, so it can tell a quiet minute from a quiet day."""
+    worked, so it can tell a quiet minute from a quiet day.
+
+    The clock is the LAST message of the request, not part of the system
+    prompt: measured 2026-11-12 on go/deepseek-v4.1-flash, a one-second
+    change in the system prompt cached 0 of 1297 tokens, while the same
+    change at the tail still cached 88%."""
 
     def setUp(self):
         self.tg = FakeTG()
@@ -3107,9 +3117,43 @@ class TestSystemPromptAndClock(unittest.TestCase):
         self.assertTrue(sys_msgs, "no system message was sent")
         content = sys_msgs[0]["content"]
         self.assertIn("FIRST SYSTEM PROMPT", content)   # from SYSTEM.md
-        self.assertIn("[time]", content)
-        self.assertIn("UTC", content)                   # current time present
-        self.assertIn("none (first message in this session)", content)
+        self.assertNotIn("[time]", content)             # clock is NOT here
+        clock = msgs[-1]
+        self.assertEqual(clock["role"], "user")         # ...it trails instead
+        self.assertIn("[time]", clock["content"])
+        self.assertIn("UTC", clock["content"])
+        self.assertIn("none (first message in this session)", clock["content"])
+
+    def test_system_prompt_is_stable_so_the_prefix_can_cache(self):
+        """The clock changes every request; the system prompt must not."""
+        first = self._system(self._run_turn("hello"))[0]["content"]
+        with mock.patch.object(main.time, "time",
+                               return_value=float(int(main.time.time()) + 3600)):
+            second = self._run_turn("hello again")
+        self.assertEqual(first, self._system(second)[0]["content"])
+        # ...while the trailing clock did move
+        self.assertNotEqual(self._run_turn("hello"), second)
+
+    def test_clock_is_refreshed_on_every_round(self):
+        """A long run must not believe it is still the moment it started."""
+        seen = []
+        clock = {"t": 1000.0}
+
+        def fake_chat(*a, **k):
+            seen.append(a[3][-1]["content"])
+            clock["t"] += 600.0
+            return ("", "", [{"id": "c1", "name": "read_file",
+                              "arguments": {"path": "a"}}]) if len(seen) == 1 \
+                else ("done", "", None)
+
+        with mock.patch.object(providers, "chat", side_effect=fake_chat), \
+                mock.patch.object(main.tools_mod, "execute", lambda *a: "x"), \
+                mock.patch.object(main.time, "time", lambda: clock["t"]):
+            main.handle_message(self.cfg, self.tg, msg(text="go"), self.state)
+        self.assertEqual(len(seen), 2)
+        self.assertIn("[time]", seen[0])
+        self.assertIn("[time]", seen[1])
+        self.assertNotEqual(seen[0], seen[1])   # 10 minutes later, not frozen
 
     def test_system_prompt_edit_is_live_on_the_next_message(self):
         """No restart, no reload: the second turn must already carry the
@@ -3122,7 +3166,7 @@ class TestSystemPromptAndClock(unittest.TestCase):
 
     def test_clock_reports_the_gap_since_the_previous_turn(self):
         self._run_turn("hello")
-        content = self._system(self._run_turn("hello again"))[0]["content"]
+        content = self._run_turn("hello again")[-1]["content"]
         self.assertNotIn("none (first message", content)
         self.assertIn(" ago", content)      # last activity -> elapsed gap
         self.assertIn("UTC", content)

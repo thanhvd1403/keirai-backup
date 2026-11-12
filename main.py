@@ -1991,6 +1991,25 @@ def _clock_block(state, chat_id, thread_id, now=None):
             "message)" % (_fmt_ts(now), when))
 
 
+CLOCK_NOTE = ("above is a machine-stamped clock, not a message to act on: it is "
+              "refreshed on every request, so it is the moment THIS request was "
+              "sent")
+
+def _clock_msg(state, chat_id, thread_id):
+    """The clock as a TRAILING user message, rebuilt on every round.
+
+    Measured 2026-11-12 on go/deepseek-v4.1-flash, 3 reps of a 1297-token
+    prompt: with the clock in the SYSTEM prompt a one-second change cached
+    0/1297 tokens; the same change in a trailing message cached 1152/1297
+    (88%). So the system prompt stays byte-identical for the life of the
+    config (the whole cross-turn prefix caches), and the clock rides at the
+    end, where being fresh every round costs almost nothing - which also
+    fixes a long run reasoning about a clock frozen at turn start."""
+    return {"role": "user",
+            "content": "%s\n(%s)" % (_clock_block(state, chat_id, thread_id),
+                                      CLOCK_NOTE)}
+
+
 INTERRUPT_NOTE = ("[This run was interrupted by the user before it finished - "
                   "any running command/tool did not complete.]")
 
@@ -2165,12 +2184,10 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
     _close_tool_rounds(history)  # safety net: no dangling tool_calls ever
     # the WHOLE session goes to the model - no message cap (auto-compact bounds size)
     # system prompt = SYSTEM.md, re-read on every request so an edit lands on
-    # the very next message, plus the [time] block (now + when this session
-    # last had agent activity - computed before this turn's first persist, so
-    # it describes the previous turn's end, not work in progress)
+    # the very next message. NO clock here: the [time] block rides at the END
+    # of each request (_clock_msg) - in the system prompt it invalidated the
+    # entire prompt cache every turn (measured: 0 of 1297 tokens cached)
     sys_text = config_mod.system_prompt(cfg)
-    clock = _clock_block(state, chat_id, thread_id)
-    sys_text = ("%s\n\n%s" % (sys_text, clock)) if sys_text else clock
     messages = ([{"role": "system", "content": sys_text}]
                 if sys_text else []) + _prompt(history)
     tool_specs = tools_mod.available_specs(cfg)
@@ -2213,14 +2230,18 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
         if stop():
             interrupted = True
             break
-        _ensure_reasoning(messages)  # DeepSeek refuses a history missing the key
+        # fresh clock on every round: a 56-round run must not believe it is
+        # still the moment the turn began (the system prompt stays untouched,
+        # so the conversation prefix keeps caching)
+        prompt = messages + [_clock_msg(state, chat_id, thread_id)]
+        _ensure_reasoning(prompt)  # DeepSeek refuses a history missing the key
         tcs, got = None, False
         if live:
             susage = {}
             try:
                 answer, reasoning, tcs = _stream_answer(
                     tg, msg, live, stop, provider_name, api_key, model_id,
-                    messages, session_id, tools=tool_specs or None,
+                    prompt, session_id, tools=tool_specs or None,
                     thread_id=thread_id, usage_out=susage)
                 got = True
             except Exception as e:
@@ -2230,7 +2251,7 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
         if not got and not stop():
             tg.typing(chat_id, thread_id)
             try:
-                answer, reasoning, tcs = pcall(messages, tools=tool_specs or None)
+                answer, reasoning, tcs = pcall(prompt, tools=tool_specs or None)
             except Exception as e:
                 # keep the turn (user message + any tool rounds) per policy;
                 # just close unanswered calls so the next request is valid
@@ -2356,7 +2377,7 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
         # no text and no tool calls either: one retry with tools off
         tg.typing(chat_id, thread_id)
         try:
-            answer, reasoning, _ = pcall(messages)
+            answer, reasoning, _ = pcall(messages + [_clock_msg(state, chat_id, thread_id)])
         except Exception as e:
             _close_tool_rounds(history)
             state.persist(chat_id, thread_id)
