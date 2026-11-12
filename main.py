@@ -1801,6 +1801,62 @@ def _keep_midturn_answer(tg, live, chat_id, thread_id, answer, cfg):
         tg.send(chat_id, part, thread_id)
 
 
+class _ToolHeartbeat:
+    """One chat message that says a long tool call is still alive.
+
+    Silent until the call has run a minute (tools.HEARTBEAT_S), then it posts
+    "\u23f3 bash still running - 1m 00s" and EDITS that same message every
+    minute after, so a 200-second submission reads as work in progress
+    instead of a dead bot. When the call returns, the message is finalized
+    with how long it took - "crashed" and "slow" must never look alike.
+
+    Purely cosmetic: every Telegram error is swallowed, and a call that
+    finishes in less than a minute sends nothing at all.
+    """
+
+    def __init__(self, tg, chat_id, thread_id, name, preview):
+        self.tg, self.chat_id, self.thread_id = tg, chat_id, thread_id
+        self.name, self.preview = name, preview
+        self.msg_id = None
+        self.started = time.time()
+
+    @staticmethod
+    def _fmt(secs):
+        secs = int(secs)
+        return ("%dm %02ds" % (secs // 60, secs % 60)) if secs >= 60 else ("%ds" % secs)
+
+    def _text(self, secs, done=False):
+        if done:
+            return "\u2705 <code>%s</code> finished in %s" % (
+                _esc(self.name), self._fmt(secs))
+        return ("\u23f3 <code>%s</code> still running - %s\n<code>%s</code>"
+                % (_esc(self.name), self._fmt(secs), _esc(self.preview[:160])))
+
+    def tick(self, elapsed=None):
+        """First beat creates the message; later beats edit it in place."""
+        # the tool's own clock when it gives one (it starts before we do)
+        secs = float(elapsed) if elapsed is not None else time.time() - self.started
+        self.elapsed = secs
+        try:
+            if self.msg_id is None:
+                self.msg_id = self.tg.send(self.chat_id, self._text(secs),
+                                           self.thread_id)["message_id"]
+            else:
+                self.tg.edit_text(self.chat_id, self.msg_id, self._text(secs))
+        except Exception:  # cosmetic only - never fail a tool call over it
+            pass
+
+    def done(self):
+        if self.msg_id is None:  # fast call - nothing was ever shown
+            return
+        secs = max(getattr(self, "elapsed", 0), time.time() - self.started)
+        try:
+            self.tg.edit_text(self.chat_id, self.msg_id,
+                              self._text(secs, done=True))
+        except Exception:
+            pass
+
+
 def _stream_draft(tg, live, chat_id, thread_id, answer):
     """Modern streaming API: sendRichMessageDraft (Bot API 10.1) streams the
     answer as an animated preview in the chat - real-time, no message to
@@ -2252,15 +2308,20 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
                 history.append({"role": "tool", "tool_call_id": t["id"],
                                 "content": result})
                 continue
+            preview = tools_mod.preview(t["name"], t["arguments"])
             try:
                 tg.send(chat_id, "\U0001f527 <code>%s</code> %s"
-                        % (_esc(t["name"]),
-                           _esc(tools_mod.preview(t["name"], t["arguments"]))),
-                        thread_id)
+                        % (_esc(t["name"]), _esc(preview)), thread_id)
             except tg_mod.TelegramError:
                 pass
             ctx.pop("_spill", None)
-            result = tools_mod.execute(cfg, t["name"], t["arguments"], ctx)
+            beat = _ToolHeartbeat(tg, chat_id, thread_id, t["name"], preview)
+            ctx["progress"] = beat.tick
+            try:
+                result = tools_mod.execute(cfg, t["name"], t["arguments"], ctx)
+            finally:
+                ctx.pop("progress", None)
+                beat.done()
             spill = ctx.pop("_spill", None)
             messages.append({"role": "tool", "tool_call_id": t["id"],
                              "content": result})

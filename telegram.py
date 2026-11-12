@@ -137,6 +137,15 @@ class Telegram:
         payload = {"chat_id": chat_id, "message_id": message_id, "rich_message": rich}
         return self.call("editMessageText", payload, timeout=30)
 
+    def edit_text(self, chat_id, message_id, text):
+        """Plain HTML edit of a message that was sent with send() - the tool
+        heartbeat is a normal message, not a rich one, so it cannot use
+        edit_rich."""
+        return self.call("editMessageText", {
+            "chat_id": chat_id, "message_id": message_id, "text": text,
+            "parse_mode": "HTML",
+            "link_preview_options": {"is_disabled": True}}, timeout=30)
+
     def delete_message(self, chat_id, message_id):
         # NOTE: the Bot API method is deleteMessage (camelCase) - a snake
         # case name is a 404 "Not Found", which silently broke every cleanup

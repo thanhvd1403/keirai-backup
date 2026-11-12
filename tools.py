@@ -353,6 +353,13 @@ def _survivors(proc):
     return pgid, entries
 
 
+# A tool call silent for a minute looks like a crash - taskmarket submissions
+# and browser installs routinely spin for 200s. The caller passes a
+# `progress(seconds)` callback in ctx; it fires once per interval so the chat
+# can show "still running" instead of nothing.
+HEARTBEAT_S = 60
+
+
 def _bash(cfg, args, ctx):
     command = str(args.get("command", "")).strip()
     if not command:
@@ -366,12 +373,15 @@ def _bash(cfg, args, ctx):
     timeout = int(args.get("timeout_seconds") or getattr(cfg, "bash_timeout", 30))
     timeout = max(1, min(timeout, 300))
     interrupt = ctx.get("interrupt") if isinstance(ctx, dict) else None
+    progress = ctx.get("progress") if isinstance(ctx, dict) else None
     # start_new_session: our own process group, so a timeout can kill every
     # descendant (incl. backgrounded ones) instead of just the shell
     proc = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, errors="replace",
                             start_new_session=True)
-    deadline = time.time() + timeout
+    started = time.time()
+    next_beat = started + HEARTBEAT_S
+    deadline = started + timeout
     timed_out = interrupted = False
     while True:  # poll so /stop can kill a running command mid-flight
         try:
@@ -386,6 +396,14 @@ def _bash(cfg, args, ctx):
                 timed_out = True
                 out = _kill_and_drain(proc)
                 break
+            if progress:
+                now = time.time()
+                if now >= next_beat:
+                    next_beat = now + HEARTBEAT_S
+                    try:
+                        progress(int(now - started))
+                    except Exception:  # a heartbeat must never break the call
+                        pass
     out = out or ""
     # the group survives a normal return on purpose - report what it left behind
     if not interrupted and not timed_out:

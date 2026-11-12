@@ -187,6 +187,27 @@ class TestBash(unittest.TestCase):
                     "grep -n 'systemctl restart' deploy/idle_restart.sh"):
             self.assertFalse(tools._self_restart(cmd), cmd)
 
+    def test_heartbeat_fires_while_a_command_runs(self):
+        """A call that outlives HEARTBEAT_S reports progress, so the chat can
+        show 'still running' instead of silence (taskmarket spins for 200s)."""
+        beats = []
+        with mock.patch.object(tools, "HEARTBEAT_S", 1):
+            out = tools.execute(self.cfg, "bash", {
+                "command": "%s -c \"import time; time.sleep(2.6)\"" % PY,
+                "timeout_seconds": 10}, {"progress": beats.append})
+        self.assertIn("exit code 0", out)
+        self.assertTrue(beats, "no heartbeat for a 2.6s call with a 1s beat")
+        self.assertTrue(all(isinstance(b, int) and b >= 1 for b in beats), beats)
+
+    def test_heartbeat_errors_never_break_the_call(self):
+        def boom(_secs):
+            raise RuntimeError("telegram exploded")
+        with mock.patch.object(tools, "HEARTBEAT_S", 1):
+            out = tools.execute(self.cfg, "bash", {
+                "command": "%s -c \"import time; time.sleep(1.4)\"" % PY,
+                "timeout_seconds": 10}, {"progress": boom})
+        self.assertIn("exit code 0", out)
+
     def test_timeout(self):
         out = tools.execute(self.cfg, "bash", {
             "command": "%s -c \"import time; time.sleep(10)\"" % PY,

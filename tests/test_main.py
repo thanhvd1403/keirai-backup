@@ -17,6 +17,7 @@ class FakeTG:
         self.rich = []       # (chat_id, {"markdown"|"html": src}, thread_id)
         self.edits = []      # (chat_id, message_id, src)
         self.deleted = []    # (chat_id, message_id)
+        self.text_edits = []  # (chat_id, message_id, text) - plain HTML edits
         self.drafts = []     # (chat_id, draft_id, src, thread_id, can_stop)
         self.media = []
         self.file_bytes = b"fakeimage"
@@ -36,6 +37,10 @@ class FakeTG:
             raise Exception("Bad Request: message thread not found")
         self.sent.append((chat_id, text, thread_id))
         return {"message_id": len(self.sent)}
+
+    def edit_text(self, chat_id, message_id, text):
+        self.text_edits.append((chat_id, message_id, text))
+        return True
 
     def send_rich(self, chat_id, markdown=None, html=None, thread_id=None):
         src = {"markdown": markdown} if markdown is not None else {"html": html}
@@ -1768,6 +1773,48 @@ class TestToolLoop(unittest.TestCase):
                                   "   ", cfg)
         self.assertEqual(self.tg.rich, [])
         self.assertEqual(self.tg.sent, [])
+
+    def test_tool_heartbeat_says_still_running_then_finished(self):
+        """A slow tool must look alive: one message at the first minute, an
+        edit every minute after, finalized with its duration."""
+        def fake_exec(cfg, name, args, ctx):
+            ctx["progress"](60)          # first beat -> message created
+            ctx["progress"](120)         # second beat -> edited in place
+            return "done"
+
+        with mock.patch.object(main, "_maybe_name_session", lambda *a, **k: None), \
+                mock.patch.object(main.tools_mod, "execute", fake_exec), \
+                mock.patch.object(main.time, "time", lambda: 1000.0), \
+                mock.patch.object(providers, "chat", side_effect=[
+                    ("", "", [{"id": "c1", "name": "read_file",
+                               "arguments": {"path": "a"}}]),
+                    ("all done", "", None)]):
+            main.handle_message(self.cfg, self.tg, msg(text="go"), self.state)
+        beats_text = [t for _c, t, _th in self.tg.sent if "still running" in t]
+        self.assertEqual(len(beats_text), 1)          # exactly ONE message
+        self.assertIn("\u23f3", beats_text[0])
+        self.assertIn("1m 00s", beats_text[0])
+        self.assertIn("read_file", beats_text[0])
+        # the second beat edited that same message, and so did the finish
+        hb_id = [i for i, (_c, t, _th) in enumerate(self.tg.sent)
+                 if "still running" in t][0] + 1  # fake send: id = position
+        self.assertEqual([mid for _c, mid, _t in self.tg.text_edits],
+                         [hb_id, hb_id])
+        self.assertIn("still running - 2m 00s", self.tg.text_edits[0][2])
+        self.assertIn("\u2705", self.tg.text_edits[1][2])
+        self.assertIn("finished in 2m 00s", self.tg.text_edits[1][2])
+
+    def test_tool_heartbeat_stays_silent_for_fast_calls(self):
+        """Sub-minute calls send nothing extra - no heartbeat noise."""
+        with mock.patch.object(main, "_maybe_name_session", lambda *a, **k: None), \
+                mock.patch.object(main.tools_mod, "execute", lambda *a: "quick"), \
+                mock.patch.object(providers, "chat", side_effect=[
+                    ("", "", [{"id": "c1", "name": "read_file",
+                               "arguments": {"path": "a"}}]),
+                    ("all done", "", None)]):
+            main.handle_message(self.cfg, self.tg, msg(text="go"), self.state)
+        self.assertEqual([t for _c, t, _th in self.tg.sent if "still running" in t], [])
+        self.assertEqual(self.tg.text_edits, [])
 
     def test_close_tool_rounds_and_orphan_tools(self):
         h = [{"role": "user", "content": "go"},
