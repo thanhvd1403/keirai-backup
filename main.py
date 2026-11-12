@@ -1071,11 +1071,10 @@ def cmd_compact(cfg, tg, msg, thread_id, state):
     tg.typing(chat_id, thread_id)
     before_n, before_tok = len(history), _history_tokens(history, cfg)
     cusage = {}
-    backup_dir = _precompact_dir(state, chat_id, thread_id)
     try:
         folded = _compact(cfg, provider, api_key, model_id, history,
                           _session_header(meta.get("session_id")),
-                          backup_dir=backup_dir, usage_out=cusage)
+                          usage_out=cusage)
     except Exception as e:
         _err(tg, msg, thread_id, "compaction failed: %s" % e)
         return
@@ -1554,11 +1553,11 @@ SUMMARY_LABEL = "[Summary of earlier conversation]"
 
 # opencode's compaction strategy, ported (MIT - see THIRD_PARTY_NOTICES.md):
 # a checkpoint is "summary + the newest N tokens of the real conversation",
-# never a summary of everything. The port's own additions are the disk
-# snapshot (_write_precompact) and the anchor reuse on repeat compaction.
+# never a summary of everything. A second compaction updates the first
+# summary as an anchor instead of summarizing its own output. Nothing here
+# deletes: the store is append-only, so a fold only moves the visible window
+# (sessions.Store.save_session) and the raw stays below it.
 COMPACT_KEEP_TOKENS = 15_000  # recent conversation kept verbatim beside the summary
-COMPACT_BACKUPS = 5           # pre-compaction snapshots kept per session
-COMPACT_BACKUP_MAX_BYTES = 20_000_000  # past this, drop image bytes from a snapshot
 
 COMPACT_SECTIONS = """\
 Structure the summary with these EXACT sections, in this order:
@@ -1639,71 +1638,8 @@ def _compact_tail_start(history, budget):
     return start
 
 
-def _strip_images(messages):
-    """Same messages with image bytes replaced by a marker (snapshot size cap)."""
-    out = []
-    for m in messages:
-        c = m.get("content")
-        if isinstance(c, list) and any(
-                isinstance(p, dict) and p.get("type") == "image_url" for p in c):
-            m = dict(m)
-            m["content"] = [
-                ({"type": "text", "text": "[image omitted from snapshot]"}
-                 if isinstance(p, dict) and p.get("type") == "image_url" else p)
-                for p in c]
-        out.append(m)
-    return out
-
-
-def _precompact_dir(state, chat_id, thread_id):
-    """sessions/<session-id>/precompact/ - where raw pre-compaction history
-    goes. None without a store (tests, --no-persist)."""
-    path = getattr(getattr(state, "store", None), "path", None)
-    if not path:
-        return None
-    sid = state.ensure_meta(chat_id, thread_id).get("session_id")
-    if not sid:
-        return None
-    return os.path.join(os.path.dirname(os.path.abspath(path)), "sessions",
-                        str(sid), "precompact")
-
-
-def _write_precompact(dirpath, history, summary):
-    """Snapshot the conversation BEFORE it is replaced.
-
-    Compaction is lossy and used to be irreversible: `history[:] =` overwrote
-    the raw messages and that was that. The newest COMPACT_BACKUPS snapshots
-    stay on disk, so an over-eager fold can be inspected or restored. Best
-    effort - a failed snapshot never blocks compaction."""
-    if not dirpath:
-        return None
-    try:
-        os.makedirs(dirpath, exist_ok=True)
-        # microseconds: two compactions in the same second must not collide
-        stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime()) \
-            + ".%06dZ" % (int(time.time() * 1_000_000) % 1_000_000)
-        path = os.path.join(dirpath, stamp + ".json")
-        payload = {"at": stamp, "messages": list(history), "summary": summary}
-        blob = json.dumps(payload, ensure_ascii=False)
-        if len(blob) > COMPACT_BACKUP_MAX_BYTES:
-            payload["messages"] = _strip_images(payload["messages"])
-            payload["images_stripped"] = True
-            blob = json.dumps(payload, ensure_ascii=False)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(blob)
-        os.replace(tmp, path)
-        for old in sorted(os.listdir(dirpath))[:-COMPACT_BACKUPS]:
-            if old.endswith(".json"):
-                os.remove(os.path.join(dirpath, old))
-        return path
-    except OSError as e:
-        log.warning("pre-compact snapshot failed: %s", e)
-        return None
-
-
 def _compact(cfg, provider, api_key, model_id, history, session_id,
-             backup_dir=None, usage_out=None):
+             usage_out=None):
     """Summarize the older part of history, keep the newest turns verbatim.
 
     Two properties matter, and both were missing when `keep` was a message
@@ -1770,7 +1706,8 @@ def _compact(cfg, provider, api_key, model_id, history, session_id,
                                                [{"role": "user", "content": prompt}],
                                                session_id=session_id,
                                                usage_out=usage_out)
-    _write_precompact(backup_dir, history, summary)
+    # this fold deletes nothing: the raw conversation stays in
+    # session_messages below base_seq (sessions.Store.save_session)
     marker = [
         {"role": "user", "content": SUMMARY_LABEL + "\n" + summary},
         {"role": "assistant", "content": "Understood. Continuing with that context."},
@@ -2341,9 +2278,7 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
         cusage = {}
         try:
             history[:] = _compact(cfg, provider_name, api_key, model_id, history,
-                                  session_id, usage_out=cusage,
-                                  backup_dir=_precompact_dir(state, chat_id,
-                                                             thread_id))
+                                  session_id, usage_out=cusage)
             _strip_orphan_tools(history)
             _record_usage(cfg, state, chat_id, thread_id, cusage,
                           provider_name, model_id)

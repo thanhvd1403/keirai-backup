@@ -7,6 +7,7 @@ is opened with check_same_thread=False and every access goes through one
 re-entrant lock (SQLite stays happy, compound ops stay atomic).
 """
 import json
+import logging
 import os
 import secrets
 import shutil
@@ -14,14 +15,35 @@ import sqlite3
 import threading
 import time
 
+log = logging.getLogger(__name__)
+
 SCHEMA = """
+-- A conversation is stored APPEND-ONLY in session_messages: one row per
+-- message, written once, never rewritten. This table only says which slice
+-- of those rows is visible right now:
+--   visible = seq in [base_seq, base_seq + n_msgs)
+-- Compaction lowers n_msgs (and moves base_seq forward) instead of deleting,
+-- so the raw conversation survives every fold - the same property opencode
+-- gets from its message table. `messages` is the pre-append-only blob and is
+-- emptied by _migrate() on first boot; it stays in the schema so an old
+-- database still opens.
 CREATE TABLE IF NOT EXISTS sessions (
   chat_id INTEGER NOT NULL,
   thread_id INTEGER NOT NULL,
   model TEXT,
-  messages TEXT NOT NULL,
+  messages TEXT NOT NULL DEFAULT '',
   updated_at REAL NOT NULL,
+  base_seq INTEGER NOT NULL DEFAULT 1,
+  n_msgs INTEGER NOT NULL DEFAULT 0,
+  next_seq INTEGER NOT NULL DEFAULT 1,
   PRIMARY KEY (chat_id, thread_id)
+);
+CREATE TABLE IF NOT EXISTS session_messages (
+  chat_id INTEGER NOT NULL,
+  thread_id INTEGER NOT NULL,
+  seq INTEGER NOT NULL,
+  payload TEXT NOT NULL,
+  PRIMARY KEY (chat_id, thread_id, seq)
 );
 CREATE TABLE IF NOT EXISTS topics (
   chat_id INTEGER NOT NULL,
@@ -57,8 +79,53 @@ class Store:
         self.lock = threading.RLock()
         with self.lock:
             self.conn.executescript(SCHEMA)
+            self._add_missing_columns()
+            self._migrate()
             self._backfill_meta()
             self.conn.commit()
+
+    def _add_missing_columns(self):
+        """ALTER for databases created before append-only messages.
+
+        SQLite has no `ADD COLUMN IF NOT EXISTS`; PRAGMA tells us what is
+        there. Steady state this writes nothing (no DDL, no transaction)."""
+        have = {r[1] for r in self.conn.execute("PRAGMA table_info(sessions)")}
+        for name, decl in (("base_seq", "INTEGER NOT NULL DEFAULT 1"),
+                           ("n_msgs", "INTEGER NOT NULL DEFAULT 0"),
+                           ("next_seq", "INTEGER NOT NULL DEFAULT 1")):
+            if name not in have:
+                self.conn.execute("ALTER TABLE sessions ADD COLUMN %s %s"
+                                  % (name, decl))
+
+    def _migrate(self):
+        """Move history blobs into session_messages, once.
+
+        A row is unconverted while it still carries a JSON blob and claims no
+        visible messages; nothing else qualifies, so this is a no-op from the
+        second boot on. seq is 1-based and preserved across the conversion so
+        the archive below the first fold starts exactly where the blob did."""
+        rows = self.conn.execute(
+            "SELECT chat_id, thread_id, messages FROM sessions"
+            " WHERE n_msgs = 0 AND messages != ''").fetchall()
+        for chat_id, thread_id, blob in rows:
+            try:
+                messages = json.loads(blob)
+            except ValueError:
+                log.warning("migration: unreadable history blob for"
+                            " chat=%s thread=%s - left as is", chat_id, thread_id)
+                continue
+            self.conn.execute(
+                "DELETE FROM session_messages WHERE chat_id=? AND thread_id=?",
+                (chat_id, thread_id))
+            self.conn.executemany(
+                "INSERT INTO session_messages (chat_id, thread_id, seq, payload)"
+                " VALUES (?, ?, ?, ?)",
+                [(chat_id, thread_id, i + 1, json.dumps(m, ensure_ascii=False))
+                 for i, m in enumerate(messages)])
+            self.conn.execute(
+                "UPDATE sessions SET messages='', base_seq=1, n_msgs=?, next_seq=?"
+                " WHERE chat_id=? AND thread_id=?",
+                (len(messages), len(messages) + 1, chat_id, thread_id))
 
     def _backfill_meta(self):
         """Give pre-existing sessions a session id; fill any NULL ids.
@@ -85,15 +152,50 @@ class Store:
     # ------------------------------------------------ sessions
 
     def save_session(self, chat_id, thread_id, model, messages):
+        """Write the session through, appending only what is new.
+
+        O(new messages) instead of re-serializing the whole history at every
+        tool boundary. A shorter list means compaction: the window moves on
+        and the rows already written stay behind as the archive, so a fold
+        can no longer destroy the raw conversation."""
         if not messages:
             self.delete_session(chat_id, thread_id)
             return
         with self.lock:
+            row = self.conn.execute(
+                "SELECT base_seq, n_msgs, next_seq FROM sessions"
+                " WHERE chat_id=? AND thread_id=?", (chat_id, thread_id)).fetchone()
+            base, visible, nxt = row if row else (1, 0, 1)
+            if visible and (len(messages) < visible or not self._same_message(
+                    chat_id, thread_id, base + visible - 1, messages[visible - 1])):
+                # not an append: a new generation starts above the old rows
+                base, visible = nxt, 0
+            fresh = [(chat_id, thread_id, nxt + i, json.dumps(m, ensure_ascii=False))
+                     for i, m in enumerate(messages[visible:])]
+            if fresh:
+                self.conn.executemany(
+                    "INSERT INTO session_messages (chat_id, thread_id, seq, payload)"
+                    " VALUES (?, ?, ?, ?)", fresh)
+                nxt += len(fresh)
             self.conn.execute(
-                "INSERT OR REPLACE INTO sessions (chat_id, thread_id, model, messages, updated_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (chat_id, thread_id, model, json.dumps(messages), time.time()))
+                "INSERT INTO sessions (chat_id, thread_id, model, messages, updated_at,"
+                " base_seq, n_msgs, next_seq) VALUES (?, ?, ?, '', ?, ?, ?, ?)"
+                " ON CONFLICT(chat_id, thread_id) DO UPDATE SET"
+                " model=excluded.model, updated_at=excluded.updated_at,"
+                " base_seq=excluded.base_seq, n_msgs=excluded.n_msgs,"
+                " next_seq=excluded.next_seq",
+                (chat_id, thread_id, model, time.time(), base, len(messages), nxt))
             self.conn.commit()
+
+    def _same_message(self, chat_id, thread_id, seq, message):
+        """True when the row already stored at `seq` is this exact message.
+        A cheap append/diverge test: only the last visible message is checked,
+        which is what distinguishes "one more round" from "history rewritten"."""
+        row = self.conn.execute(
+            "SELECT payload FROM session_messages"
+            " WHERE chat_id=? AND thread_id=? AND seq=?",
+            (chat_id, thread_id, seq)).fetchone()
+        return bool(row) and row[0] == json.dumps(message, ensure_ascii=False)
 
     def delete_session(self, chat_id, thread_id):
         with self.lock:
@@ -102,6 +204,9 @@ class Store:
                 (chat_id, thread_id)).fetchone()
             self.conn.execute("DELETE FROM sessions WHERE chat_id=? AND thread_id=?",
                               (chat_id, thread_id))
+            self.conn.execute(
+                "DELETE FROM session_messages WHERE chat_id=? AND thread_id=?",
+                (chat_id, thread_id))
             self.conn.execute("DELETE FROM session_meta WHERE chat_id=? AND thread_id=?",
                               (chat_id, thread_id))
             self.conn.commit()
@@ -117,16 +222,55 @@ class Store:
         shutil.rmtree(root, ignore_errors=True)
 
     def load_sessions(self):
-        """[(chat_id, thread_id, model_or_None, messages, updated_at)]"""
+        """[(chat_id, thread_id, model_or_None, messages, updated_at)]
+
+        Only the VISIBLE slice comes back. Everything below base_seq is the
+        archive: still on disk, never sent, recoverable with load_archived().
+        """
         with self.lock:
             rows = self.conn.execute(
-                "SELECT chat_id, thread_id, model, messages, updated_at FROM sessions").fetchall()
-        out = []
-        for chat_id, thread_id, model, messages, updated in rows:
+                "SELECT s.chat_id, s.thread_id, s.model, s.updated_at, m.payload"
+                " FROM sessions s LEFT JOIN session_messages m"
+                " ON m.chat_id = s.chat_id AND m.thread_id = s.thread_id"
+                " AND m.seq >= s.base_seq AND m.seq < s.base_seq + s.n_msgs"
+                " ORDER BY s.chat_id, s.thread_id, m.seq").fetchall()
+        out, seen = [], None
+        for chat_id, thread_id, model, updated, payload in rows:
+            key = (chat_id, thread_id)
+            if key != seen:
+                out.append((chat_id, thread_id, model, [], updated))
+                seen = key
+            if payload is None:
+                continue
             try:
-                out.append((chat_id, thread_id, model, json.loads(messages), updated))
+                out[-1][3].append(json.loads(payload))
             except ValueError:
                 continue  # corrupt row: skip
+        return out
+
+    def archive_count(self, chat_id, thread_id):
+        """How many folded-away messages are still on disk for this session."""
+        with self.lock:
+            return self.conn.execute(
+                "SELECT COUNT(*) FROM session_messages m JOIN sessions s"
+                " ON m.chat_id = s.chat_id AND m.thread_id = s.thread_id"
+                " WHERE m.chat_id=? AND m.thread_id=? AND m.seq < s.base_seq",
+                (chat_id, thread_id)).fetchone()[0]
+
+    def load_archived(self, chat_id, thread_id):
+        """The folded-away messages, oldest first - what a summary replaced."""
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT m.payload FROM session_messages m JOIN sessions s"
+                " ON m.chat_id = s.chat_id AND m.thread_id = s.thread_id"
+                " WHERE m.chat_id=? AND m.thread_id=? AND m.seq < s.base_seq"
+                " ORDER BY m.seq", (chat_id, thread_id)).fetchall()
+        out = []
+        for (payload,) in rows:
+            try:
+                out.append(json.loads(payload))
+            except ValueError:
+                continue
         return out
 
     def list_sessions(self):
@@ -141,6 +285,7 @@ class Store:
                 "SELECT session_id FROM session_meta WHERE chat_id=?",
                 (chat_id,)).fetchall()]
             self.conn.execute("DELETE FROM sessions WHERE chat_id=?", (chat_id,))
+            self.conn.execute("DELETE FROM session_messages WHERE chat_id=?", (chat_id,))
             self.conn.execute("DELETE FROM topics WHERE chat_id=?", (chat_id,))
             self.conn.execute("DELETE FROM session_meta WHERE chat_id=?", (chat_id,))
             self.conn.commit()
@@ -159,8 +304,12 @@ class Store:
         now = time.time()
         with self.lock:
             self.conn.execute(
-                "INSERT OR REPLACE INTO sessions (chat_id, thread_id, model, messages, updated_at)"
-                " VALUES (?, ?, NULL, '[]', ?)", (chat_id, thread_id, now))
+                "DELETE FROM session_messages WHERE chat_id=? AND thread_id=?",
+                (chat_id, thread_id))
+            self.conn.execute(
+                "INSERT OR REPLACE INTO sessions (chat_id, thread_id, model, messages,"
+                " updated_at, base_seq, n_msgs, next_seq)"
+                " VALUES (?, ?, NULL, '', ?, 1, 0, 1)", (chat_id, thread_id, now))
             self.conn.execute(
                 "DELETE FROM session_meta WHERE chat_id=? AND thread_id=?",
                 (chat_id, thread_id))
@@ -180,6 +329,9 @@ class Store:
                 raise ValueError("target slot %s/%s is occupied" % (chat_id, to))
             self.conn.execute(
                 "UPDATE sessions SET thread_id=? WHERE chat_id=? AND thread_id=?",
+                (to, chat_id, frm))
+            self.conn.execute(
+                "UPDATE session_messages SET thread_id=? WHERE chat_id=? AND thread_id=?",
                 (to, chat_id, frm))
             self.conn.execute(
                 "UPDATE session_meta SET thread_id=? WHERE chat_id=? AND thread_id=?",

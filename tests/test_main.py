@@ -654,9 +654,9 @@ class TestCompactStrategy(unittest.TestCase):
         self.assertEqual(len(self.state.get_history(100, None)), 6)
 
 
-class TestPreCompactSnapshot(unittest.TestCase):
-    """Compaction overwrote the raw history in place; a snapshot now lands on
-    disk first (sessions/<session-id>/precompact/), newest few kept."""
+class TestSessionArchive(unittest.TestCase):
+    """Compaction never deletes: the store is append-only, so a fold only
+    moves the visible window and the raw conversation stays below it."""
 
     def setUp(self):
         import sessions as sessions_mod
@@ -668,29 +668,40 @@ class TestPreCompactSnapshot(unittest.TestCase):
         self.cfg = make_config()
         disable_titles(self)
 
-    @mock.patch.object(providers, "chat", return_value=("S", "", None))
-    def test_snapshot_keeps_the_raw_messages(self, _):
+    def test_folded_messages_stay_on_disk(self):
         hist = self.state.get_history(100, None)
         for i in range(6):
             hist.append({"role": "user", "content": "ask %d" % i})
             hist.append({"role": "assistant", "content": "reply %d" % i})
-        main.handle_message(self.cfg, self.tg, msg(text="/compact"), self.state)
-        sid = self.state.ensure_meta(100, None)["session_id"]
-        folder = os.path.join(self.dir, "sessions", sid, "precompact")
-        files = sorted(os.listdir(folder))
-        self.assertEqual(len(files), 1)
-        with open(os.path.join(folder, files[0])) as f:
-            snap = json.load(f)
-        self.assertEqual(len(snap["messages"]), 12)  # everything, pre-fold
-        self.assertEqual(snap["messages"][0]["content"], "ask 0")
-        self.assertEqual(snap["summary"], "S")
+        self.state.persist(100, None)
+        with mock.patch.object(providers, "chat", return_value=("S", "", None)):
+            main.handle_message(self.cfg, self.tg, msg(text="/compact"), self.state)
+        self.assertLess(len(self.state.get_history(100, None)), 12)
+        raw = self.store.load_archived(100, 0)
+        self.assertEqual(len(raw), 12)  # everything, pre-fold
+        self.assertEqual(raw[0]["content"], "ask 0")
+        self.assertEqual(len(self.store.load_sessions()[0][3]), 4)  # marker + tail
 
-    @mock.patch.object(providers, "chat", return_value=("S", "", None))
-    def test_snapshots_are_pruned(self, _):
-        folder = main._precompact_dir(self.state, 100, None)
-        for i in range(main.COMPACT_BACKUPS + 3):
-            main._write_precompact(folder, [{"role": "user", "content": str(i)}], "s")
-        self.assertEqual(len(os.listdir(folder)), main.COMPACT_BACKUPS)
+    def test_reopening_the_bot_sees_only_the_visible_slice(self):
+        """The archive must not leak back into context on restart."""
+        hist = self.state.get_history(100, None)
+        hist.extend([{"role": "user", "content": "one"},
+                     {"role": "assistant", "content": "two"}])
+        self.state.persist(100, None)
+        with mock.patch.object(providers, "chat", return_value=("S", "", None)):
+            main.handle_message(self.cfg, self.tg, msg(text="/compact"), self.state)
+        fresh = main.State(True, self.store)
+        self.assertEqual(len(fresh.get_history(100, None)),
+                         len(self.state.get_history(100, None)))
+
+    def test_delete_removes_the_archive_too(self):
+        hist = self.state.get_history(100, None)
+        hist.extend([{"role": "user", "content": "x"}])
+        self.state.persist(100, None)
+        with mock.patch.object(providers, "chat", return_value=("S", "", None)):
+            main.handle_message(self.cfg, self.tg, msg(text="/compact"), self.state)
+        self.store.delete_session(100, 0)
+        self.assertEqual(self.store.load_archived(100, 0), [])
 
 
 class TestCompactThreshold(unittest.TestCase):
@@ -1154,10 +1165,16 @@ class TestPersistence(unittest.TestCase):
         self.assertEqual(self.store.load_topics(), [])
 
     def test_corrupt_row_skipped(self):
+        """One unreadable message row is skipped, not fatal: the rest loads."""
+        self.store.save_session(1, 0, None, [{"role": "user", "content": "a"},
+                                             {"role": "user", "content": "b"}])
         self.store.conn.execute(
-            "INSERT INTO sessions VALUES (1, 0, NULL, 'not-json', 0)")
+            "UPDATE session_messages SET payload='not-json'"
+            " WHERE chat_id=1 AND thread_id=0 AND seq=1")
         self.store.conn.commit()
-        self.assertEqual(self.store.load_sessions(), [])
+        rows = self.store.load_sessions()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][3], [{"role": "user", "content": "b"}])
 
     def test_threaded_writes(self):
         """Session workers run concurrently: the shared connection must
@@ -1902,11 +1919,14 @@ class TestToolLoop(unittest.TestCase):
         def fake_exec(cfg, name, args, ctx):
             if args.get("path") == "b":  # second call of the same round
                 conn = __import__("sqlite3").connect(db)
-                row = conn.execute(
-                    "SELECT messages FROM sessions WHERE chat_id=100 AND thread_id=0"
-                ).fetchone()
+                rows = conn.execute(
+                    "SELECT m.payload FROM session_messages m JOIN sessions s"
+                    " ON m.chat_id=s.chat_id AND m.thread_id=s.thread_id"
+                    " WHERE m.chat_id=100 AND m.thread_id=0"
+                    " AND m.seq >= s.base_seq AND m.seq < s.base_seq + s.n_msgs"
+                    " ORDER BY m.seq").fetchall()
                 conn.close()
-                seen["mid"] = json.loads(row[0]) if row else []
+                seen["mid"] = [json.loads(r[0]) for r in rows]
             return "result for %s" % args.get("path")
 
         with mock.patch.object(main, "_maybe_name_session", lambda *a, **k: None), \
@@ -1926,9 +1946,12 @@ class TestToolLoop(unittest.TestCase):
         self.assertFalse([c for c in contents if c == "result for b"])
         # and the finished turn is on disk too
         conn = __import__("sqlite3").connect(db)
-        final = json.loads(conn.execute(
-            "SELECT messages FROM sessions WHERE chat_id=100 AND thread_id=0"
-        ).fetchone()[0])
+        final = [json.loads(r[0]) for r in conn.execute(
+            "SELECT m.payload FROM session_messages m JOIN sessions s"
+            " ON m.chat_id=s.chat_id AND m.thread_id=s.thread_id"
+            " WHERE m.chat_id=100 AND m.thread_id=0"
+            " AND m.seq >= s.base_seq AND m.seq < s.base_seq + s.n_msgs"
+            " ORDER BY m.seq").fetchall()]
         conn.close()
         self.assertEqual(final[-1]["content"], "all done")
 

@@ -142,7 +142,7 @@ config.py      TOML config + env overrides
 telegram.py    raw Bot API client (HTTP, multipart, rich messages, edits)
 md2tg.py       markdown -> Telegram HTML, message splitting
 providers.py   OpenCode Zen/Go clients (blocking + streaming), pricing
-sessions.py    SQLite store (history, models, topics, usage)
+sessions.py    SQLite store (append-only messages + visible window, topics, usage)
 tools.py       LLM tool registry: files, shell, dispatch
 websearch.py   Exa MCP client (web_search_exa / web_fetch_exa)
 browser.py     Lightpanda wrapper (optional browse tool)
