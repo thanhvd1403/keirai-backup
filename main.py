@@ -2282,7 +2282,8 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
         answer = None  # next round must produce the final text
 
     if interrupted or stop():
-        _deliver_interrupted(tg, state, msg, thread_id, answer, live, reasoning)
+        _deliver_interrupted(tg, state, msg, thread_id, answer, live, reasoning,
+                             cfg)
         return
 
     if not (answer or "").strip():
@@ -2327,8 +2328,15 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
             tg.send(chat_id, part, thread_id)
 
 
-def _deliver_interrupted(tg, state, msg, thread_id, partial, live, reasoning=None):
-    """Record the /stop interruption in context and tell the user."""
+def _deliver_interrupted(tg, state, msg, thread_id, partial, live, reasoning=None,
+                         cfg=None):
+    """Record the /stop interruption in context and tell the user.
+
+    What the user could already see stays visible: the round's prose is
+    finalized as a real message (same rule as a tool round - see
+    _keep_midturn_answer) and the current round's thinking block is kept
+    instead of deleted, so an interrupted turn looks like any other round
+    that happened rather than one that was erased."""
     chat_id = msg["chat"]["id"]
     history = state.get_history(chat_id, thread_id)
     _close_tool_rounds(history)  # keep the partial round; close its calls
@@ -2339,7 +2347,11 @@ def _deliver_interrupted(tg, state, msg, thread_id, partial, live, reasoning=Non
     history.append(hist_msg)
     _strip_orphan_tools(history)
     state.persist(chat_id, thread_id)
-    _drop_live(tg, live, chat_id)  # drop the half-finished live message(s)
+    if cfg is not None:
+        # the partial prose is real output the user already watched stream -
+        # keep it above the stop notice rather than deleting it with the view
+        _keep_midturn_answer(tg, live, chat_id, thread_id, partial, cfg)
+    _drop_live(tg, live, chat_id, keep_thinking=True)  # no stale progress views
     log.info("turn interrupted by user: chat=%s thread=%s", chat_id, thread_id)
     try:
         tg.send(chat_id, "\u23f9 stopped - the running reply/tool was interrupted.",

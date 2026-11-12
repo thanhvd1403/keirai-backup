@@ -1259,16 +1259,22 @@ class TestStop(unittest.TestCase):
         self.assertIn("partial answer", hist[-1]["content"])
         # user was told; no final full answer was delivered
         self.assertTrue(any("stopped" in t for _c, t, _th in self.tg.sent))
-        # edit-mode placeholder was created while thinking, then dropped on /stop
+        # what already streamed STAYS: the partial prose is finalized as a
+        # real message and the thinking block is kept - nothing is deleted
         self.assertTrue(self.tg.rich)
-        self.assertTrue(self.tg.deleted)
+        self.assertEqual(self.tg.deleted, [])
+        # the text that had actually streamed when /stop landed
+        kept = [src.get("markdown") or "" for _c, src, _t in self.tg.rich]
+        self.assertTrue(any(k.startswith("partial answer will not finish")
+                            for k in kept), kept)
         # turn bookkeeping cleared
         self.assertNotIn((100, None), state.active_turns)
         self.assertNotIn((100, None), state.interrupts)
 
     @mock.patch.object(providers, "chat_stream")
-    def test_interrupt_drops_live_placeholder(self, stream_mock):
-        """Edit-mode placeholder is deleted when the turn is stopped."""
+    def test_interrupt_keeps_what_already_streamed(self, stream_mock):
+        """/stop must not erase visible output: the partial text keeps its
+        message (finalized, not deleted) and the thinking block stays."""
         def gen():
             yield "reasoning", "hmm"
             self.state.request_interrupt((100, None))
@@ -1277,8 +1283,10 @@ class TestStop(unittest.TestCase):
         stream_mock.return_value = gen()
         g = {"id": 100, "type": "supergroup"}
         main.handle_message(self.cfg, self.tg, msg(text="hi", chat=g), self.state)
-        self.assertTrue(self.tg.rich)          # placeholder was created
-        self.assertTrue(self.tg.deleted)       # ...and cleaned up on /stop
+        self.assertTrue(self.tg.rich)          # messages were streamed
+        self.assertEqual(self.tg.deleted, [])  # ...and nothing was wiped
+        self.assertTrue(any(src.get("markdown") == "started"
+                            for _c, src, _t in self.tg.rich))
         self.assertTrue(any("stopped" in t for _c, t, _th in self.tg.sent))
 
 
