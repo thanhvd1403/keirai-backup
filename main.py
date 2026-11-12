@@ -1071,14 +1071,20 @@ def cmd_compact(cfg, tg, msg, thread_id, state):
     tg.typing(chat_id, thread_id)
     before_n, before_tok = len(history), _history_tokens(history, cfg)
     cusage = {}
+    backup_dir = _precompact_dir(state, chat_id, thread_id)
     try:
-        history[:] = _compact(cfg, provider, api_key, model_id, history,
-                              _session_header(meta.get("session_id")),
-                              usage_out=cusage)
-        _strip_orphan_tools(history)
+        folded = _compact(cfg, provider, api_key, model_id, history,
+                          _session_header(meta.get("session_id")),
+                          backup_dir=backup_dir, usage_out=cusage)
     except Exception as e:
         _err(tg, msg, thread_id, "compaction failed: %s" % e)
         return
+    if folded is history:  # nothing older than the checkpoint + the tail
+        tg.send(chat_id, "nothing to compact - the checkpoint already covers "
+                "everything before the recent turns", thread_id)
+        return
+    history[:] = folded
+    _strip_orphan_tools(history)
     _record_usage(cfg, state, chat_id, thread_id, cusage, provider, model_id)
     state.persist(chat_id, thread_id)
     log.info("manual compact: chat=%s thread=%s %d->%d msgs", chat_id, thread_id,
@@ -1544,23 +1550,199 @@ def _history_tokens(history, cfg=None):
     return n
 
 
-def _compact(cfg, provider, api_key, model_id, history, session_id, keep=4,
-             usage_out=None):
-    """Summarize the older part of history, keep the last `keep` messages.
-    Returns the new message list."""
-    tail = list(history[-keep:]) if len(history) > keep else list(history)
-    older = history[:-keep] if len(history) > keep else []
-    if not older:
+SUMMARY_LABEL = "[Summary of earlier conversation]"
+
+# opencode's compaction strategy, ported (MIT - see THIRD_PARTY_NOTICES.md):
+# a checkpoint is "summary + the newest N tokens of the real conversation",
+# never a summary of everything. The port's own additions are the disk
+# snapshot (_write_precompact) and the anchor reuse on repeat compaction.
+COMPACT_KEEP_TOKENS = 15_000  # recent conversation kept verbatim beside the summary
+COMPACT_BACKUPS = 5           # pre-compaction snapshots kept per session
+COMPACT_BACKUP_MAX_BYTES = 20_000_000  # past this, drop image bytes from a snapshot
+
+COMPACT_SECTIONS = """\
+Structure the summary with these EXACT sections, in this order:
+
+## Goal
+One sentence: what the user is ultimately trying to accomplish.
+
+## Constraints & Preferences
+Rules, constraints and preferences the user stated - style, naming,
+approaches to avoid, and anything about how the work must be done.
+
+## Progress
+### Done
+### In Progress
+### Blocked
+
+## Key Decisions
+Decisions made, and why.
+
+## Next Steps
+What comes next, in order.
+
+## Critical Context
+Facts needed to continue: versions, ids, error strings, measured numbers.
+
+## Relevant Files
+`path` - one line on why it matters.
+
+Rules:
+- Keep every section, even when it is empty.
+- Terse bullets, never prose paragraphs.
+- Preserve exact file paths, commands, error strings, numbers and identifiers
+  verbatim whenever they are known.
+- Do not mention this summary or that context was compacted.
+- Output only the summary."""
+
+COMPACT_FRESH = ("Write a detailed summary of the conversation below. It "
+                 "replaces that conversation, so the next turn has to be able "
+                 "to continue from it alone.\n\n" + COMPACT_SECTIONS)
+
+COMPACT_UPDATE = ("Update the anchored summary below with the conversation that "
+                  "follows it. Keep every fact that is still true, drop what is "
+                  "now stale or wrong, and merge in what is new: one summary, "
+                  "not two.\n\n<anchored_summary>\n%s\n</anchored_summary>\n\n"
+                  + COMPACT_SECTIONS)
+
+
+def _is_summary_marker(m):
+    c = m.get("content") if isinstance(m, dict) else None
+    return isinstance(c, str) and c.startswith(SUMMARY_LABEL)
+
+
+def _compact_keep_tokens(cfg, provider, model_id):
+    """Recent conversation kept verbatim, in tokens. Bounded: the tail has to
+    leave the summary and the next turn room, so it cannot be a fixed share
+    of a window that keeps growing (opencode v1 clamps its quarter-of-window
+    rule to 2k..15k for the same reason)."""
+    ctx = _model_context(cfg, "%s/%s" % (provider, model_id)) or cfg.context_limit_tokens
+    return max(2_000, min(COMPACT_KEEP_TOKENS, int(ctx * 0.10)))
+
+
+def _compact_tail_start(history, budget):
+    """Index where the verbatim tail begins.
+
+    A turn opens at a user message; the tail is the newest whole turns whose
+    messages fit `budget` tokens. The newest turn is kept whatever its size -
+    a summary with no recent turns beside it is the thing this replaces."""
+    starts = [i for i, m in enumerate(history) if m.get("role") == "user"]
+    if not starts:
+        return len(history)  # no turn boundary to cut on: fold nothing
+    total, start = 0, len(history)
+    for s in reversed(starts):
+        cost = sum(_msg_tokens(m) for m in history[s:start])
+        if start < len(history) and total + cost > budget:
+            break
+        total += cost
+        start = s
+    return start
+
+
+def _strip_images(messages):
+    """Same messages with image bytes replaced by a marker (snapshot size cap)."""
+    out = []
+    for m in messages:
+        c = m.get("content")
+        if isinstance(c, list) and any(
+                isinstance(p, dict) and p.get("type") == "image_url" for p in c):
+            m = dict(m)
+            m["content"] = [
+                ({"type": "text", "text": "[image omitted from snapshot]"}
+                 if isinstance(p, dict) and p.get("type") == "image_url" else p)
+                for p in c]
+        out.append(m)
+    return out
+
+
+def _precompact_dir(state, chat_id, thread_id):
+    """sessions/<session-id>/precompact/ - where raw pre-compaction history
+    goes. None without a store (tests, --no-persist)."""
+    path = getattr(getattr(state, "store", None), "path", None)
+    if not path:
+        return None
+    sid = state.ensure_meta(chat_id, thread_id).get("session_id")
+    if not sid:
+        return None
+    return os.path.join(os.path.dirname(os.path.abspath(path)), "sessions",
+                        str(sid), "precompact")
+
+
+def _write_precompact(dirpath, history, summary):
+    """Snapshot the conversation BEFORE it is replaced.
+
+    Compaction is lossy and used to be irreversible: `history[:] =` overwrote
+    the raw messages and that was that. The newest COMPACT_BACKUPS snapshots
+    stay on disk, so an over-eager fold can be inspected or restored. Best
+    effort - a failed snapshot never blocks compaction."""
+    if not dirpath:
+        return None
+    try:
+        os.makedirs(dirpath, exist_ok=True)
+        # microseconds: two compactions in the same second must not collide
+        stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime()) \
+            + ".%06dZ" % (int(time.time() * 1_000_000) % 1_000_000)
+        path = os.path.join(dirpath, stamp + ".json")
+        payload = {"at": stamp, "messages": list(history), "summary": summary}
+        blob = json.dumps(payload, ensure_ascii=False)
+        if len(blob) > COMPACT_BACKUP_MAX_BYTES:
+            payload["messages"] = _strip_images(payload["messages"])
+            payload["images_stripped"] = True
+            blob = json.dumps(payload, ensure_ascii=False)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(blob)
+        os.replace(tmp, path)
+        for old in sorted(os.listdir(dirpath))[:-COMPACT_BACKUPS]:
+            if old.endswith(".json"):
+                os.remove(os.path.join(dirpath, old))
+        return path
+    except OSError as e:
+        log.warning("pre-compact snapshot failed: %s", e)
+        return None
+
+
+def _compact(cfg, provider, api_key, model_id, history, session_id,
+             backup_dir=None, usage_out=None):
+    """Summarize the older part of history, keep the newest turns verbatim.
+
+    Two properties matter, and both were missing when `keep` was a message
+    count and every compaction summarized the whole history:
+    - the tail is a TOKEN budget cut on a turn boundary (COMPACT_KEEP_TOKENS),
+      so recent detail survives verbatim and no round is half-kept;
+    - a second compaction UPDATES the existing summary as an anchor instead of
+      summarizing its own summary, so detail does not decay per generation
+      (a summary of a summary of a summary keeps the shape and loses the facts).
+    Returns the new message list; the same list when there is nothing to fold."""
+    start = _compact_tail_start(history, _compact_keep_tokens(cfg, provider, model_id))
+    if start >= len(history):
+        return history  # no turn boundary to cut on: nothing to fold
+    if start == 0:
+        # The budget swallows every turn (a small session, or a small window):
+        # keep the newest turn verbatim and fold the rest - a compaction that
+        # makes no progress would fire again on the very next turn.
+        starts = [i for i, m in enumerate(history) if m.get("role") == "user"]
+        if len(starts) < 2:
+            return history
+        start = starts[-1]
+    tail = list(history[start:])
+    head = history[:start]
+    anchored = ""
+    if head and _is_summary_marker(head[0]):
+        anchored = head[0]["content"][len(SUMMARY_LABEL):].strip()
+        # the checkpoint's own "Understood." follows the summary
+        head = head[1:]
+        if head and head[0].get("role") == "assistant":
+            head = head[1:]
+    if not head:
         return history
     # The summary request is built from a text transcript (never raw
     # messages), but a session with no message cap could still make that
-    # transcript too big for the window - keep the newest older messages
-    # first, up to ~1/8 of the window (chars, worst-case estimator = 1/2).
+    # transcript too big for the window - keep the newest messages first.
     ctx = _model_context(cfg, "%s/%s" % (provider, model_id)) or cfg.context_limit_tokens
     budget = max(8_000, ctx * CHARS_PER_TOKEN // 8)
     transcript, size = [], 0
-    for m in reversed(older):
-        role = m.get("role", "?")
+    for m in reversed(head):
         c = m.get("content")
         if isinstance(c, list):
             c = " ".join(p.get("text", "") for p in c if isinstance(p, dict)
@@ -1576,21 +1758,21 @@ def _compact(cfg, provider, api_key, model_id, history, session_id, keep=4,
             for tc in m.get("tool_calls") or [])
         text = ("%s\n[calls: %s]" % (c[:2000], calls[:CALL_BLOCK_CHARS])
                 if calls else c)
-        line = "%s: %s" % (role, text[:4000])
+        line = "%s: %s" % (m.get("role", "?"), text[:4000])
         if transcript and size + len(line) > budget:
             break
         transcript.append(line)
         size += len(line)
     transcript.reverse()
-    prompt = ("Summarize this earlier conversation concisely in markdown "
-              "(facts, decisions, open tasks, user preferences), under 400 words:\n\n"
-              + "\n".join(transcript))
+    prompt = (COMPACT_UPDATE % anchored) if anchored else COMPACT_FRESH
+    prompt += "\n\n<conversation>\n" + "\n".join(transcript) + "\n</conversation>"
     summary, _reasoning, _tcs = providers.chat(provider, api_key, model_id,
                                                [{"role": "user", "content": prompt}],
                                                session_id=session_id,
                                                usage_out=usage_out)
+    _write_precompact(backup_dir, history, summary)
     marker = [
-        {"role": "user", "content": "[Summary of earlier conversation]\n" + summary},
+        {"role": "user", "content": SUMMARY_LABEL + "\n" + summary},
         {"role": "assistant", "content": "Understood. Continuing with that context."},
     ]
     return marker + tail
@@ -2159,7 +2341,9 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
         cusage = {}
         try:
             history[:] = _compact(cfg, provider_name, api_key, model_id, history,
-                                  session_id, usage_out=cusage)
+                                  session_id, usage_out=cusage,
+                                  backup_dir=_precompact_dir(state, chat_id,
+                                                             thread_id))
             _strip_orphan_tools(history)
             _record_usage(cfg, state, chat_id, thread_id, cusage,
                           provider_name, model_id)

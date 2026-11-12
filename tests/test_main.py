@@ -516,11 +516,15 @@ class TestCompact(unittest.TestCase):
         self._seed(10)
         main.handle_message(self.cfg, self.tg, msg(text="/compact"), self.state)
         hist = self.state.get_history(100, None)
-        self.assertEqual(len(hist), 6)  # 2 summary marker + last 4
+        # 2 summary marker + the newest turn kept verbatim. This seed is
+        # ~100 tokens a message, far under the keep budget, so the tail is
+        # everything up to the last turn boundary: 8 messages folded.
+        self.assertEqual(len(hist), 4)
         self.assertIn("[Summary of earlier conversation]", hist[0]["content"])
         self.assertIn("THE SUMMARY", hist[0]["content"])
+        self.assertEqual(hist[-2]["content"][:9], "message 8")
         self.assertEqual(hist[-1]["content"][:9], "message 9")
-        self.assertIn("compacted: 10 -> 6 messages (~", self.tg.sent[-1][1])
+        self.assertIn("compacted: 10 -> 4 messages (~", self.tg.sent[-1][1])
 
     @mock.patch.object(providers, "chat", return_value=("THE SUMMARY", "", None))
     def test_compact_transcript_keeps_tool_calls(self, chat_mock):
@@ -580,6 +584,113 @@ class TestCompact(unittest.TestCase):
         self.assertIn("[Summary of earlier conversation]", hist[0]["content"])
         self.assertEqual(hist[-1]["content"], "final answer")
         self.assertEqual(chat_mock.call_count, 2)
+
+
+class TestCompactStrategy(unittest.TestCase):
+    """opencode's shape: a checkpoint is "summary + newest N tokens of the
+    real conversation", the summary is an UPDATE of the previous one, and the
+    raw history is snapshotted before it is replaced."""
+
+    def setUp(self):
+        self.tg = FakeTG()
+        self.state = main.State(True)
+        self.cfg = make_config()
+        disable_titles(self)
+
+    def _turns(self, n, size=40):
+        hist = self.state.get_history(100, None)
+        for i in range(n):
+            hist.append({"role": "user", "content": "ask %d " % i + "z" * size})
+            hist.append({"role": "assistant", "content": "reply %d " % i + "z" * size})
+        return hist
+
+    @mock.patch.object(providers, "chat", return_value=("S", "", None))
+    def test_tail_is_a_budget_cut_on_a_turn_boundary(self, _):
+        """Messages are never split: the tail opens with a user message, and
+        the keep budget decides how many whole turns survive."""
+        self._turns(6, size=200)
+        # ~106 tokens a turn: a 220-token budget leaves room for 2 turns
+        with mock.patch.object(main, "COMPACT_KEEP_TOKENS", 220), \
+             mock.patch.object(main, "_compact_keep_tokens", lambda *a: 220):
+            main.handle_message(self.cfg, self.tg, msg(text="/compact"), self.state)
+        hist = self.state.get_history(100, None)
+        self.assertEqual(hist[0]["content"][:11], "[Summary of")
+        tail = [m for m in hist if m["role"] == "user"][1:]  # skip the marker
+        self.assertEqual(tail[0]["content"][:5], "ask 4")  # whole turns only
+        self.assertIn("ask 5", hist[-2]["content"])
+
+    @mock.patch.object(providers, "chat", return_value=("UPDATED", "", None))
+    def test_second_compaction_updates_the_anchor(self, chat_mock):
+        """Summarizing a summary loses facts one generation at a time: the
+        old summary is handed over as an anchor to update, not as material."""
+        hist = self.state.get_history(100, None)
+        hist.extend([
+            {"role": "user", "content": "[Summary of earlier conversation]\nOLD FACTS"},
+            {"role": "assistant", "content": "Understood. Continuing with that context."},
+            {"role": "user", "content": "new ask " + "y" * 100},
+            {"role": "assistant", "content": "new reply"},
+            {"role": "user", "content": "latest ask"},
+            {"role": "assistant", "content": "latest reply"},
+        ])
+        with mock.patch.object(main, "_compact_keep_tokens", lambda *a: 20):
+            main.handle_message(self.cfg, self.tg, msg(text="/compact"), self.state)
+        sent = chat_mock.call_args[0][3][0]["content"]
+        self.assertIn("<anchored_summary>", sent)
+        self.assertIn("OLD FACTS", sent)
+        self.assertEqual(sent.count("OLD FACTS"), 1)  # anchor, not transcript too
+        self.assertIn("new ask", sent)
+        hist = self.state.get_history(100, None)
+        self.assertIn("UPDATED", hist[0]["content"])
+        self.assertEqual(sum(1 for m in hist
+                             if m["content"].startswith("[Summary of")), 1)
+
+    @mock.patch.object(providers, "chat", return_value=("S", "", None))
+    def test_no_turn_boundary_is_a_noop(self, _):
+        hist = self.state.get_history(100, None)
+        for i in range(6):
+            hist.append({"role": "assistant", "content": "orphan %d" % i})
+        with mock.patch.object(main, "_compact_keep_tokens", lambda *a: 1):
+            main.handle_message(self.cfg, self.tg, msg(text="/compact"), self.state)
+        self.assertEqual(len(self.state.get_history(100, None)), 6)
+
+
+class TestPreCompactSnapshot(unittest.TestCase):
+    """Compaction overwrote the raw history in place; a snapshot now lands on
+    disk first (sessions/<session-id>/precompact/), newest few kept."""
+
+    def setUp(self):
+        import sessions as sessions_mod
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.dir, True))
+        self.store = sessions_mod.Store(os.path.join(self.dir, "sessions.db"))
+        self.state = main.State(True, store=self.store)
+        self.tg = FakeTG()
+        self.cfg = make_config()
+        disable_titles(self)
+
+    @mock.patch.object(providers, "chat", return_value=("S", "", None))
+    def test_snapshot_keeps_the_raw_messages(self, _):
+        hist = self.state.get_history(100, None)
+        for i in range(6):
+            hist.append({"role": "user", "content": "ask %d" % i})
+            hist.append({"role": "assistant", "content": "reply %d" % i})
+        main.handle_message(self.cfg, self.tg, msg(text="/compact"), self.state)
+        sid = self.state.ensure_meta(100, None)["session_id"]
+        folder = os.path.join(self.dir, "sessions", sid, "precompact")
+        files = sorted(os.listdir(folder))
+        self.assertEqual(len(files), 1)
+        with open(os.path.join(folder, files[0])) as f:
+            snap = json.load(f)
+        self.assertEqual(len(snap["messages"]), 12)  # everything, pre-fold
+        self.assertEqual(snap["messages"][0]["content"], "ask 0")
+        self.assertEqual(snap["summary"], "S")
+
+    @mock.patch.object(providers, "chat", return_value=("S", "", None))
+    def test_snapshots_are_pruned(self, _):
+        folder = main._precompact_dir(self.state, 100, None)
+        for i in range(main.COMPACT_BACKUPS + 3):
+            main._write_precompact(folder, [{"role": "user", "content": str(i)}], "s")
+        self.assertEqual(len(os.listdir(folder)), main.COMPACT_BACKUPS)
 
 
 class TestCompactThreshold(unittest.TestCase):

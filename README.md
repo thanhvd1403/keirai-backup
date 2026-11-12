@@ -154,6 +154,9 @@ tests/         unit tests (unittest, stdlib)
 
 Keirai is licensed under **AGPLv3** (see [LICENSE](LICENSE)).
 
+Third-party components, and the notices their licenses require, are listed in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
 ## Contributing
 
 Contributions are welcome! Open an issue to discuss bigger changes, or send a
