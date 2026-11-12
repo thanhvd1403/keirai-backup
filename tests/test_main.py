@@ -898,8 +898,9 @@ class TestStreaming(unittest.TestCase):
 
     @mock.patch.object(providers, "chat_stream")
     def test_tool_round_drops_answer_view_keeps_thinking(self, stream_mock):
-        """Edit mode (groups, no drafts): the round's answer progress view
-        is deleted before the next round streams (stale), while its thinking
+        """Edit mode (groups, no drafts): the round's answer view is FINALIZED
+        as a real message when the round turns out to call a tool (the prose
+        must not vanish when the tool line appears), while its thinking
         message stays - it is that round's permanent block now."""
         fd, path = tempfile.mkstemp(suffix=".txt")
         os.close(fd)
@@ -924,9 +925,12 @@ class TestStreaming(unittest.TestCase):
         with mock.patch.object(main.time, "time", fake_time):
             main.handle_message(make_config(stream_drafts=True), self.tg,
                                 msg(text="read it", chat=g), self.state)
-        # only the ANSWER progress message went away - the thinking block of
-        # round 1 survived as a permanent, fully edited block
-        self.assertEqual([mid for _c, mid in self.tg.deleted], [1000 + 2])
+        # nothing was deleted: the round's prose kept its message (finalized
+        # to what had streamed) and round 1's thinking block stayed a
+        # permanent, fully edited block
+        self.assertEqual(self.tg.deleted, [])
+        edits = [(mid, s) for _c, mid, s in self.tg.edits]
+        self.assertIn((1000 + 2, {"markdown": "on it"}), edits)
         # groups never stream drafts (the Bot API rejects them there)
         self.assertEqual(self.tg.drafts, [])
         edits = [(mid, s) for _c, mid, s in self.tg.edits]
@@ -1712,6 +1716,50 @@ class TestToolLoop(unittest.TestCase):
         self.assertEqual(hist[2]["content"], "partial result")
         self.assertIn("not executed", hist[3]["content"])
         self.assertIn("interrupted", hist[4]["content"])
+
+    def test_midturn_prose_is_not_swallowed_by_the_tool_round(self):
+        """The model's line before acting ("checking the log first") used to
+        survive only as a streaming side effect - deleted in edit mode, an
+        ephemeral draft in draft mode. 74 of 423 stored tool rounds carry
+        such prose, so it has to reach the chat for real."""
+        cfg = make_config(stream_drafts=True, stream_mode="draft")
+        rounds = [("Checking the log first.", "", [
+            {"id": "c1", "name": "read_file", "arguments": {"path": "a"}}])]
+        with mock.patch.object(main, "_maybe_name_session", lambda *a, **k: None), \
+                mock.patch.object(main, "_stream_answer",
+                                  side_effect=lambda *a, **k: rounds.pop(0)), \
+                mock.patch.object(main.tools_mod, "execute", lambda *a: "file body"), \
+                mock.patch.object(providers, "chat",
+                                  return_value=("finished", "", None)):
+            main.handle_message(cfg, self.tg, msg(text="go"), self.state)
+        marks = [src for _chat, src, _tid in self.tg.rich]
+        self.assertIn({"markdown": "Checking the log first."}, marks)
+        # the prose keeps its slot in the chat: nothing deleted, and the final
+        # answer comes after it
+        self.assertEqual(self.tg.deleted, [])
+        self.assertEqual(marks[-1], {"markdown": "finished"})
+        self.assertLess(marks.index({"markdown": "Checking the log first."}),
+                        marks.index({"markdown": "finished"}))
+
+    def test_midturn_prose_adopts_the_edit_mode_message(self):
+        """Edit mode already has a real message: finalize it instead of
+        sending a duplicate, and detach it so _drop_live leaves it alone."""
+        cfg = make_config(rich_messages=True)
+        live = main._live_new(True, False)
+        live["answer_id"], live["role"]["answer_id"] = 77, "answer"
+        main._keep_midturn_answer(self.tg, live, 100, None, "One sec.", cfg)
+        self.assertEqual(self.tg.edits, [(100, 77, {"markdown": "One sec."})])
+        self.assertEqual(self.tg.rich, [])       # no duplicate message
+        self.assertIsNone(live.get("answer_id"))  # _drop_live will not delete it
+        main._drop_live(self.tg, live, 100, keep_thinking=True)
+        self.assertNotIn((100, 77), self.tg.deleted)
+
+    def test_midturn_prose_empty_is_silent(self):
+        cfg = make_config(rich_messages=True)
+        main._keep_midturn_answer(self.tg, main._live_new(True, True), 100, None,
+                                  "   ", cfg)
+        self.assertEqual(self.tg.rich, [])
+        self.assertEqual(self.tg.sent, [])
 
     def test_close_tool_rounds_and_orphan_tools(self):
         h = [{"role": "user", "content": "go"},

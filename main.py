@@ -1759,6 +1759,48 @@ def _drop_live(tg, live, chat_id, keep_thinking=False):
             pass
 
 
+def _keep_midturn_answer(tg, live, chat_id, thread_id, answer, cfg):
+    """Publish a round's prose when the round turns out to call tools.
+
+    The model often writes a line of narration before acting ("I'll check the
+    log first"), and that text used to reach the chat only as a streaming
+    side effect: in draft mode it was an ephemeral preview, and in edit mode
+    _drop_live DELETED the message when the tool line appeared - so the user
+    saw the sentence flash and disappear. Measured 2026-11-08: 74 of the 423
+    tool-calling rounds in the store carry such prose.
+
+    Kept in place when the round already streamed it into a real message
+    (final text written, slot detached so _drop_live leaves it alone);
+    published for real in draft mode, where the preview is all there was."""
+    text = textcalls.sanitize((answer or "").strip())
+    if not text:
+        return
+    live = live or {}
+    roles = live.setdefault("role", {})
+    for slot in ("answer_id", "msg_id"):
+        if roles.get(slot) == "answer" and live.get(slot):
+            mid = live.pop(slot)
+            roles.pop(slot, None)
+            try:
+                if len(text) <= md2tg.RICH_LIMIT:
+                    tg.edit_rich(chat_id, mid, markdown=text)
+                else:  # too long for one rich message: re-send as parts
+                    tg.delete_message(chat_id, mid)
+                    for part in md2tg.send_parts(text):
+                        tg.send(chat_id, part, thread_id)
+            except tg_mod.TelegramError as e:
+                log.warning("could not finalize mid-turn message: %s", e)
+            return
+    if cfg.rich_messages:
+        try:
+            _send_rich_answer(tg, chat_id, thread_id, text, None)
+            return
+        except tg_mod.TelegramError as e:
+            log.warning("mid-turn rich send failed, using plain messages: %s", e)
+    for part in md2tg.send_parts(text):
+        tg.send(chat_id, part, thread_id)
+
+
 def _stream_draft(tg, live, chat_id, thread_id, answer):
     """Modern streaming API: sendRichMessageDraft (Bot API 10.1) streams the
     answer as an animated preview in the chat - real-time, no message to
@@ -2169,6 +2211,9 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
         if show and (reasoning or "").strip():
             _send_thinking_block(tg, chat_id, thread_id, reasoning, cfg,
                                  live=live)
+        # a round that ends in tool calls must not swallow the prose it
+        # streamed: keep it as a real message above the tool lines
+        _keep_midturn_answer(tg, live, chat_id, thread_id, answer, cfg)
         # the round's live view is now superseded (the thinking block above
         # is permanent, tool lines appear below it): release it so the NEXT
         # round streams into fresh messages underneath instead of editing
