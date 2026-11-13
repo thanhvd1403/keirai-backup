@@ -3206,9 +3206,10 @@ class TestSystemPromptAndClock(unittest.TestCase):
     worked, so it can tell a quiet minute from a quiet day.
 
     The clock is the LAST message of the request, not part of the system
-    prompt: measured 2026-11-12 on go/deepseek-v4.1-flash, a one-second
-    change in the system prompt cached 0 of 1297 tokens, while the same
-    change at the tail still cached 88%."""
+    prompt: measured 2026-11-12 on go/deepseek-v4.1-flash, compared across a
+    turn boundary, a one-second change in the system prompt cached 0 of 1297
+    tokens, while the same change at the tail still cached 88%. Within one
+    turn both placements match - that is what made the old one look fine."""
 
     def setUp(self):
         self.tg = FakeTG()

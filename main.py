@@ -2117,13 +2117,15 @@ CLOCK_NOTE = ("above is a machine-stamped clock, not a message to act on: it is 
 def _clock_msg(state, chat_id, thread_id):
     """The clock as a TRAILING user message, rebuilt on every round.
 
-    Measured 2026-11-12 on go/deepseek-v4.1-flash, 3 reps of a 1297-token
-    prompt: with the clock in the SYSTEM prompt a one-second change cached
-    0/1297 tokens; the same change in a trailing message cached 1152/1297
-    (88%). So the system prompt stays byte-identical for the life of the
-    config (the whole cross-turn prefix caches), and the clock rides at the
-    end, where being fresh every round costs almost nothing - which also
-    fixes a long run reasoning about a clock frozen at turn start."""
+    Where it sits is a cache decision. Measured 2026-11-12 on
+    go/deepseek-v4.1-flash, 3 reps of a 1297-token prompt, comparing two
+    independent requests (a turn boundary): a one-second change in the SYSTEM
+    prompt cached 0/1297 tokens, the same change at the tail cached 1152/1297
+    (88%). Rounds within one turn match either way - a turn shares one system
+    prompt - so the system prompt keeps byte-identical for the life of the
+    config and the clock rides at the end. Rebuilding it per round is a
+    separate fix: a 56-round run must not reason about a clock frozen at turn
+    start."""
     return {"role": "user",
             "content": "%s\n(%s)" % (_clock_block(state, chat_id, thread_id),
                                       CLOCK_NOTE)}
@@ -2303,9 +2305,13 @@ def _ai_reply(cfg, tg, msg, thread_id, state, text, images=None):
     _close_tool_rounds(history)  # safety net: no dangling tool_calls ever
     # the WHOLE session goes to the model - no message cap (auto-compact bounds size)
     # system prompt = SYSTEM.md, re-read on every request so an edit lands on
-    # the very next message. NO clock here: the [time] block rides at the END
-    # of each request (_clock_msg) - in the system prompt it invalidated the
-    # entire prompt cache every turn (measured: 0 of 1297 tokens cached)
+    # the very next message. It must stay byte-identical across turns: a clock
+    # in here changes at every turn boundary, so the cross-turn prefix never
+    # matches (measured: 0 of 1297 tokens cached when the timestamp moved 1s).
+    # Rounds INSIDE a turn still hit - which is why the old placement looked
+    # healthy at a 90% cache rate while every turn started cold, and why this
+    # is easy to "fix" back by accident. The [time] block rides at the END of
+    # each request instead (_clock_msg), where a 1s change costs ~31 tokens.
     sys_text = config_mod.system_prompt(cfg)
     messages = ([{"role": "system", "content": sys_text}]
                 if sys_text else []) + _prompt(history)
