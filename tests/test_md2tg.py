@@ -216,3 +216,47 @@ class TestRichSplit(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRichDollars(unittest.TestCase):
+    """Rich Markdown reads "$...$" as inline LaTeX, so the money range
+    "$0.1 - $0.2" renders as italic math "0.1 - " and the second amount
+    loses its sign. escape_rich_dollars sends GFM's backslash escape
+    instead, leaving code, links and real display math alone."""
+
+    def test_money_range_is_escaped(self):
+        self.assertEqual(md2tg.escape_rich_dollars("cost $0.1 - $0.2"),
+                         "cost \\$0.1 - \\$0.2")
+
+    def test_text_without_dollars_is_returned_untouched(self):
+        src = "plain **text** with `code` and _italics_"
+        self.assertIs(md2tg.escape_rich_dollars(src), src)
+
+    def test_second_pass_changes_nothing(self):
+        once = md2tg.escape_rich_dollars("$5 between $7 and $9")
+        self.assertEqual(md2tg.escape_rich_dollars(once), once)
+
+    def test_code_spans_and_fences_stay_literal(self):
+        for src in ("`echo $PATH`", "```\necho $HOME\n```", "~~~\n$a\n~~~",
+                    "```bash\nawk '{print $1}'\n```"):
+            self.assertEqual(md2tg.escape_rich_dollars(src), src)
+
+    def test_display_math_is_left_as_math(self):
+        self.assertEqual(md2tg.escape_rich_dollars("$$E=mc^2$$"),
+                         "$$E=mc^2$$")
+
+    def test_unclosed_display_math_becomes_literal(self):
+        # no second "$$", so there is no math span to protect: escape both
+        self.assertEqual(md2tg.escape_rich_dollars("$$x^2"), "\\$\\$x^2")
+
+    def test_bare_urls_keep_their_dollar(self):
+        src = "see https://example.dev/a$b now"
+        self.assertEqual(md2tg.escape_rich_dollars(src), src)
+
+    def test_split_rich_measures_the_escaped_source(self):
+        md = "\n\n".join(["$1"] * 30)
+        chunks = md2tg.split_rich(md, limit=40)
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk), 40)
+            self.assertNotIn("$1", chunk.replace("\\$1", ""))

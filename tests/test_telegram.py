@@ -57,6 +57,24 @@ class WireFormat(unittest.TestCase):
         self.assertNotIn("message_thread_id", self.last[1])
         self.assertEqual(self.last[1]["rich_message"], {"html": "<b>x</b>"})
 
+    def test_rich_markdown_escapes_dollars(self):
+        # Rich Markdown reads "$...$" as LaTeX; unescaped, a money range
+        # arrives as italic math instead of two amounts
+        self.tg.send_rich(100, markdown="cost $0.1 - $0.2")
+        self.assertEqual(self.last[1]["rich_message"],
+                         {"markdown": "cost \\$0.1 - \\$0.2"})
+
+    def test_rich_html_payload_is_not_escaped(self):
+        # no "$" syntax in rich HTML - escaping there would print backslashes
+        self.tg.send_rich(100, html="<b>$5</b>")
+        self.assertEqual(self.last[1]["rich_message"], {"html": "<b>$5</b>"})
+
+    def test_edit_rich_and_draft_escape_dollars(self):
+        self.tg.edit_rich(100, 5, markdown="$1")
+        self.assertEqual(self.last[1]["rich_message"], {"markdown": "\\$1"})
+        self.tg.send_rich_draft(100, 7, markdown="$1")
+        self.assertEqual(self.last[1]["rich_message"], {"markdown": "\\$1"})
+
     def test_send_rich_and_edit_rich_carry_rich_message(self):
         self.tg.send_rich(100, markdown="# hi")
         self.assertEqual(self.last[0], "sendRichMessage")

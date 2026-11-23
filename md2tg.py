@@ -365,9 +365,84 @@ def _rich_code_chunks(lang, body, limit):
     return ["```%s\n%s\n```" % (lang or "", p) for p in pieces]
 
 
+# Rich Markdown pairs two "$" into an inline LaTeX span. A money range like
+# "$0.1 - $0.2" therefore renders as italic math "0.1 - " with the second
+# amount's sign eaten - the failure is silent and looks like a typo. GFM
+# honours backslash escapes, so a bare "$" is sent as "\$".
+_DOLLAR_URL_STOP = " \t\r\n<>()\"'"
+
+
+def escape_rich_dollars(md):
+    r"""Escape a bare `$` so Rich Markdown does not read it as LaTeX.
+
+    Left alone: inline code and fenced blocks (already literal), bare URLs
+    (an escape inside a link would change the address), an existing `\$`
+    (so a second pass is a no-op), and `$$...$$` display math, which keeps
+    working on purpose - a real equation can be written that way.
+    """
+    if "$" not in md:
+        return md
+    out, i, n = [], 0, len(md)
+    while i < n:
+        ch = md[i]
+        if ch == "\\" and i + 1 < n:  # an escape of its own: keep both chars
+            out.append(md[i:i + 2])
+            i += 2
+            continue
+        if ch == "`":  # inline code span, or a whole fenced block
+            j = i
+            while j < n and md[j] == "`":
+                j += 1
+            end = md.find(md[i:j], j)
+            if end < 0:  # unmatched run: copy it and carry on
+                out.append(md[i:j])
+                i = j
+                continue
+            end += j - i
+            out.append(md[i:end])
+            i = end
+            continue
+        if ch == "~" and (i == 0 or md[i - 1] == "\n"):  # ~~~ fenced block
+            j = i
+            while j < n and md[j] == "~":
+                j += 1
+            if j - i >= 3:
+                k = md.find("\n" + md[i:j], j)
+                if k < 0:
+                    out.append(md[i:j])
+                    i = j
+                    continue
+                end = md.find("\n", k + 1)
+                end = n if end < 0 else end
+                out.append(md[i:end])
+                i = end
+                continue
+        if md.startswith("$$", i):  # display math stays math
+            end = md.find("$$", i + 2)
+            if end >= 0:
+                out.append(md[i:end + 2])
+                i = end + 2
+                continue
+        if md.startswith("http://", i) or md.startswith("https://", i):
+            j = i
+            while j < n and md[j] not in _DOLLAR_URL_STOP:
+                j += 1
+            out.append(md[i:j])
+            i = j
+            continue
+        out.append("\\$" if ch == "$" else ch)
+        i += 1
+    return "".join(out)
+
+
 def split_rich(md, limit=RICH_LIMIT):
     """Split raw markdown into source chunks for sendRichMessage (the
-    server parses GFM, so we only need source-level block splitting)."""
+    server parses GFM, so we only need source-level block splitting).
+
+    `$` is escaped first, so the limit is measured on what is actually sent
+    and a chunk can never end up one backslash over.
+    """
+    md = escape_rich_dollars(md)
     chunks, cur, cur_len = [], [], 0
     for block in split_blocks(md):
         if block[0] == "blank":

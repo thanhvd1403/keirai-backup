@@ -11,6 +11,8 @@ import uuid
 import urllib.error
 import urllib.request
 
+import md2tg
+
 API_BASE = "https://api.telegram.org"
 POLL_TIMEOUT = 25
 # Bots can download files up to 20 MB.
@@ -104,6 +106,9 @@ class Telegram:
         """Bot API 10.1+ rich message: headings, tables, task lists, details.
         Exactly one of markdown/html must be given. Supports 32768 chars."""
         rich = {"markdown": markdown} if markdown is not None else {"html": html}
+        # a bare "$" would open a LaTeX span in Rich Markdown (see md2tg)
+        if markdown is not None:
+            rich["markdown"] = md2tg.escape_rich_dollars(markdown)
         payload = {"chat_id": chat_id, "rich_message": rich}
         if thread_id:
             payload["message_thread_id"] = thread_id
@@ -122,6 +127,8 @@ class Telegram:
         message must still be sent with sendRichMessage. Private chats only.
         `can_stop=True` shows Telegram's own Stop button."""
         rich = {"markdown": markdown} if markdown is not None else {"html": html}
+        if markdown is not None:
+            rich["markdown"] = md2tg.escape_rich_dollars(markdown)
         payload = {"chat_id": chat_id, "draft_id": draft_id,
                    "rich_message": rich}
         if thread_id:
@@ -134,6 +141,8 @@ class Telegram:
         """Bot API 10.1 live edit of a previously sent rich message
         (editMessageText with rich_message). Exactly one of markdown/html."""
         rich = {"markdown": markdown} if markdown is not None else {"html": html}
+        if markdown is not None:
+            rich["markdown"] = md2tg.escape_rich_dollars(markdown)
         payload = {"chat_id": chat_id, "message_id": message_id, "rich_message": rich}
         return self.call("editMessageText", payload, timeout=30)
 
